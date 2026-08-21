@@ -2,15 +2,41 @@
  * scripts/syncDeals.js
  *
  * Mega Deals Canada — backend ingestion pipeline.
- * For each ASIN: queries Keepa (domain=6, Amazon.ca) for pricing/price-history
- * and computes the All-Time-Low flag, then cross-checks that price/
- * availability directly against Amazon via the Creators API before
- * publishing anything — Keepa polls on a delay, so a "deal" can look real
- * in Keepa's data and already be gone/changed on Amazon by the time this
- * runs. Only ASINs that verify get a Link TW affiliate deep link generated
- * and upserted into the Supabase `deals` table (onConflict: 'asin').
+ * Discovers candidate deals via Keepa's Deals API (recent price drops on
+ * Amazon.ca, domain=6) instead of a hardcoded ASIN list. For each candidate:
+ * queries Keepa's product endpoint for pricing/price-history and computes
+ * the All-Time-Low flag, then cross-checks that price/availability directly
+ * against Amazon via the Creators API before publishing anything — Keepa
+ * polls on a delay, so a "deal" can look real in Keepa's data and already
+ * be gone/changed on Amazon by the time this runs. Only ASINs that verify
+ * get a Link TW affiliate deep link generated and upserted into the
+ * Supabase `deals` table (onConflict: 'asin').
  *
  * Run with:  node scripts/syncDeals.js   (or `npm run sync-deals`)
+ *
+ * ── Keepa Deals API notes ─────────────────────────────────────────────────
+ * discoverDealAsins() hits GET https://api.keepa.com/deal with a JSON
+ * "selection" object as a query param — confirmed against Keepa's own docs
+ * (https://keepa.com/api-docs/deals.html), including the response shape
+ * (deals.dr is the array). Tunable via env vars without touching code:
+ * MIN_DEAL_DISCOUNT_PERCENT (default 20), DEAL_DISCOVERY_LIMIT (default 20,
+ * caps how many candidates get run through the full per-ASIN pipeline in
+ * one call), MIN_DEAL_RATING_STARS (default 3.5), and DEAL_BRAND_ALLOWLIST
+ * (comma-separated brand names — see DEFAULT_DEAL_BRAND_ALLOWLIST for the
+ * starter list). Books/DVDs are excluded and FBA is verified downstream in
+ * buildDealPayload() from real per-offer Keepa data, not at discovery time
+ * — see getExcludedCategoryLabel() / hasLiveFbaNewOffer() below for why.
+ *
+ * ── Discovery mode (added 2026-08-21) ────────────────────────────────────
+ * DISCOVERY_MODE env var picks the discovery source: "deals" (default,
+ * discoverDealAsins — Keepa's day-over-day price-drop feed) or "finder"
+ * (discoverDealAsinsViaProductFinder — Keepa's broader /query endpoint,
+ * filtered by category/sales-rank/rating/review-count/90-day price trend).
+ * Both functions live in this file regardless of which is active, so trying
+ * "finder" and going back to "deals" is a one-line .env.local edit — no code
+ * changes, no lost work either way. See discoverDealAsinsViaProductFinder()
+ * for field-by-field notes, including which parts of the category-ID setup
+ * are still unverified.
  *
  * ── Amazon Creators API notes ────────────────────────────────────────────
  * PA-API 5.0 was retired 2026-05-15; the Creators API is its replacement.
@@ -108,6 +134,8 @@ const supabase = createClient(VITE_SUPABASE_URL, SUPABASE_KEY);
 // ── Keepa constants ─────────────────────────────────────────────────────────
 const KEEPA_DOMAIN_CA = 6; // Amazon.ca
 const KEEPA_PRODUCT_URL = "https://api.keepa.com/product";
+const KEEPA_DEAL_URL = "https://api.keepa.com/deal";
+const KEEPA_QUERY_URL = "https://api.keepa.com/query"; // Product Finder
 
 // Keepa csv/stats.current array indices relevant to this script.
 // (Full reference: https://keepa.com/#!discuss/t/product-object/116)
@@ -118,6 +146,189 @@ const CSV_TYPE = {
   RATING: 16, // Product rating history (Keepa stores this as rating*10)
   COUNT_REVIEWS: 17, // Review count history
 };
+
+// Keepa Deals API ("selection" request) enums — confirmed against Keepa's
+// own docs at https://keepa.com/api-docs/deals.html.
+const KEEPA_PRICE_TYPE = { AMAZON: 0, NEW: 1 };
+const KEEPA_DATE_RANGE = { DAY: 0, WEEK: 1, MONTH: 2, NINETY_DAYS: 3 };
+const KEEPA_SORT_TYPE = {
+  DEAL_AGE: 1,
+  ABSOLUTE_DELTA: 2,
+  SALES_RANK: 3,
+  PERCENT_DELTA: 4,
+};
+
+// Tunable without touching code — how big a discount counts as "a deal",
+// and how many discovered ASINs to actually process in one run (each one
+// costs a Keepa product lookup + a Creators API call + a LinkTwin call).
+const MIN_DEAL_DISCOUNT_PERCENT = Number(process.env.MIN_DEAL_DISCOUNT_PERCENT) || 20;
+const DEAL_DISCOVERY_LIMIT = Number(process.env.DEAL_DISCOVERY_LIMIT) || 20;
+
+// Minimum product star rating (0-5). Keepa's own `minRating` selection field
+// uses a 0-50 integer scale (45 = 4.5 stars, confirmed against Keepa's docs
+// at https://keepa.com/api-docs/deals.html), so this converts once here.
+const MIN_DEAL_RATING_STARS = Number(process.env.MIN_DEAL_RATING_STARS) || 3.5;
+const MIN_DEAL_RATING_KEEPA_SCALE = Math.round(MIN_DEAL_RATING_STARS * 10);
+
+// "Popular brand" allowlist — a starter list of well-known consumer brands,
+// editable anytime in .env.local (comma-separated) without touching code.
+// Keepa's `brand` selection field ("Include only products from the
+// specified brand", array of strings, per Keepa's docs) filters discovery
+// results server-side, before any product/Creators-API/LinkTwin call is
+// spent on a candidate. Brand matching against Keepa's tracked brand string
+// hasn't been confirmed against a live run yet — if a brand you expect to
+// see never turns up, it may need exact-casing/spelling to match what
+// Keepa/Amazon has on file for that ASIN.
+const DEFAULT_DEAL_BRAND_ALLOWLIST =
+  "Sony,Samsung,Apple,Anker,Bose,JBL,Logitech,LEGO,Philips,Panasonic,Dyson,KitchenAid,Instant Pot,Ninja,Shark,Keurig,Black+Decker,Cuisinart,Hasbro,Mattel,Nike,Adidas,Under Armour,Crocs,Levi's,Nintendo,Microsoft,Google,Fitbit,Garmin,Bissell,Braun,Oral-B,Gillette,L'Oréal,Nivea";
+const DEAL_BRAND_ALLOWLIST = (process.env.DEAL_BRAND_ALLOWLIST || DEFAULT_DEAL_BRAND_ALLOWLIST)
+  .split(",")
+  .map((b) => b.trim())
+  .filter(Boolean);
+
+// Discovery: ask Keepa for recent price drops instead of tracking ASINs by
+// hand. Returns a list of candidate ASINs — each one still goes through the
+// full buildDealPayload() pipeline (Keepa product lookup, Creators API
+// verification, book/FBA gates below) before anything is published, so a
+// bad discovery result can't skip the verification gate.
+async function discoverDealAsins() {
+  const selection = {
+    page: 0,
+    domainId: KEEPA_DOMAIN_CA,
+    // Keepa rejects a multi-value priceTypes array ("queryJSON is of
+    // invalid format") — it wants a single price type per deals query, not
+    // a list. AMAZON (Amazon-as-seller price) is the most relevant one for
+    // "is this actually a deal on Amazon.ca".
+    priceTypes: [KEEPA_PRICE_TYPE.AMAZON],
+    dateRange: KEEPA_DATE_RANGE.DAY,
+    isRangeEnabled: true,
+    deltaPercentRange: [MIN_DEAL_DISCOUNT_PERCENT, 100],
+    isFilterEnabled: true,
+    hasReviews: true,
+    minRating: MIN_DEAL_RATING_KEEPA_SCALE,
+    sortType: KEEPA_SORT_TYPE.PERCENT_DELTA,
+    // Brand filtering only applied when the allowlist is non-empty — an
+    // empty DEAL_BRAND_ALLOWLIST env var means "no brand restriction".
+    ...(DEAL_BRAND_ALLOWLIST.length > 0 ? { brand: DEAL_BRAND_ALLOWLIST } : {}),
+    // Books are excluded downstream in buildDealPayload() via a category
+    // keyword check, not here — Keepa's excludeCategories field needs
+    // per-marketplace numeric category IDs that haven't been looked up for
+    // Amazon.ca, and FBA is verified downstream too, from real per-offer
+    // data (see hasLiveFbaNewOffer below) rather than Keepa's
+    // mustHaveAmazonOffer, which only covers Amazon-sold-and-fulfilled —
+    // narrower than "any FBA offer regardless of seller".
+  };
+
+  // This call must never crash the whole process — a Keepa rejection or
+  // outage here should fall back to FALLBACK_ASINS in main(), the same way
+  // syncDeal() swallows per-ASIN errors instead of taking down the batch.
+  try {
+    const { data } = await axios.get(KEEPA_DEAL_URL, {
+      params: { key: KEEPA_API_KEY, selection: JSON.stringify(selection) },
+    });
+
+    const deals = data?.deals?.dr;
+    if (!Array.isArray(deals)) {
+      console.warn(
+        `  ! Keepa Deals API response didn't have the expected deals.dr array. ` +
+          `Raw top-level keys: ${Object.keys(data ?? {}).join(", ")}`
+      );
+      return [];
+    }
+
+    return deals
+      .map((deal) => deal.asin)
+      .filter(Boolean)
+      .slice(0, DEAL_DISCOVERY_LIMIT);
+  } catch (err) {
+    console.warn(
+      `  ! Keepa Deals API request failed: ` +
+        (err.response?.data ? JSON.stringify(err.response.data) : err.message)
+    );
+    return [];
+  }
+}
+
+// ── Alternate discovery: Keepa Product Finder (/query) ─────────────────────
+// A second, swappable discovery source — see DISCOVERY_MODE below for how to
+// pick between this and discoverDealAsins() above without deleting either.
+// Confirmed against Keepa's own docs (https://keepa.com/api-docs/product-
+// finder.html): unlike /deal, the JSON "selection" object here does NOT
+// include domain — domain is a separate top-level query param — and the
+// response is a flat { asinList: [...], totalResults } rather than deals.dr.
+//
+// Root category node IDs for Amazon.ca (Electronics, Kitchen & Dining,
+// Tools, Smart Home) are UNVERIFIED — Keepa doesn't error on a wrong numeric
+// category ID, it just silently matches nothing, so `totalResults` logged
+// below is the tell: if it's consistently 0, check these IDs first via
+// Keepa's category browser before assuming a filter elsewhere is at fault.
+// Override via PRODUCT_FINDER_CATEGORY_IDS (comma-separated) in .env.local.
+const PRODUCT_FINDER_CATEGORIES = (
+  process.env.PRODUCT_FINDER_CATEGORY_IDS || "2242989011,2224025011,3379552011,6368817011"
+)
+  .split(",")
+  .map((id) => Number(id.trim()))
+  .filter((id) => Number.isFinite(id));
+
+const MIN_DEAL_REVIEW_COUNT = Number(process.env.MIN_DEAL_REVIEW_COUNT) || 100;
+
+async function discoverDealAsinsViaProductFinder() {
+  const selection = {
+    rootCategory: PRODUCT_FINDER_CATEGORIES,
+    current_SALES_gte: 1,
+    current_SALES_lte: 30000,
+    // "Percent change from average" over the trailing 90 days — positive
+    // means the current price is that much BELOW its own 90-day average, a
+    // sustained-discount signal rather than /deal's single-day price-drop
+    // event. Reuses the same MIN_DEAL_DISCOUNT_PERCENT tunable as the /deal
+    // path so there's one discount threshold, not two to keep in sync.
+    deltaPercent90_AMAZON_gte: MIN_DEAL_DISCOUNT_PERCENT,
+    current_RATING_gte: MIN_DEAL_RATING_KEEPA_SCALE,
+    current_COUNT_REVIEWS_gte: MIN_DEAL_REVIEW_COUNT,
+    hasReviews: true,
+    ...(DEAL_BRAND_ALLOWLIST.length > 0 ? { brand: DEAL_BRAND_ALLOWLIST } : {}),
+    page: 0,
+    perPage: Math.max(DEAL_DISCOVERY_LIMIT, 50),
+    // No categories_exclude for books/DVDs here for the same reason as
+    // /deal — needs numeric IDs we haven't verified. Every candidate this
+    // returns still passes through buildDealPayload()'s excluded-category
+    // and FBA checks (Keepa /product data), so nothing skips those gates.
+  };
+
+  try {
+    const { data } = await axios.get(KEEPA_QUERY_URL, {
+      params: { key: KEEPA_API_KEY, domain: KEEPA_DOMAIN_CA, selection: JSON.stringify(selection) },
+    });
+
+    const asinList = data?.asinList;
+    if (!Array.isArray(asinList)) {
+      console.warn(
+        `  ! Keepa Product Finder response didn't have the expected asinList array. ` +
+          `Raw top-level keys: ${Object.keys(data ?? {}).join(", ")}`
+      );
+      return [];
+    }
+
+    console.log(
+      `  Product Finder matched ${data.totalResults ?? asinList.length} total product(s) before capping ` +
+        `(0 here usually means PRODUCT_FINDER_CATEGORY_IDS need checking).`
+    );
+    return asinList.slice(0, DEAL_DISCOVERY_LIMIT);
+  } catch (err) {
+    console.warn(
+      `  ! Keepa Product Finder request failed: ` +
+        (err.response?.data ? JSON.stringify(err.response.data) : err.message)
+    );
+    return [];
+  }
+}
+
+// Which discovery source main() uses — "deals" (default, discoverDealAsins,
+// Keepa's day-over-day price-drop feed) or "finder" (discoverDealAsinsVia
+// ProductFinder, Keepa's broader filtered search). Both functions stay in
+// the file either way, so switching back is a one-line .env.local edit, not
+// a code change or a git operation.
+const DISCOVERY_MODE = (process.env.DISCOVERY_MODE || "deals").toLowerCase();
 
 async function fetchKeepaProduct(asin) {
   const { data } = await axios.get(KEEPA_PRODUCT_URL, {
@@ -182,6 +393,53 @@ function getListPriceCents(product) {
   return getLastCsvValue(product.csv?.[CSV_TYPE.LISTPRICE]);
 }
 
+// Keepa timestamps in csv[] arrays are "Keepa minutes" — minutes since the
+// Keepa epoch (2011-01-01T00:00:00Z) — not Unix time.
+const KEEPA_EPOCH_MS = Date.UTC(2011, 0, 1);
+const REFERENCE_PRICE_WINDOW_DAYS = 30;
+
+// Highest Amazon/New price actually recorded for this ASIN in the last
+// REFERENCE_PRICE_WINDOW_DAYS days — used as a "price before this drop"
+// signal for ASINs with no tracked MSRP (see getReferencePriceCents below).
+function getRecentHighPriceCents(product) {
+  const cutoffKeepaMinutes =
+    (Date.now() - REFERENCE_PRICE_WINDOW_DAYS * 24 * 60 * 60 * 1000 - KEEPA_EPOCH_MS) / 60000;
+
+  let highest = null;
+  for (const type of [CSV_TYPE.AMAZON, CSV_TYPE.NEW]) {
+    const csvArray = product.csv?.[type];
+    if (!Array.isArray(csvArray)) continue;
+    for (let i = 0; i < csvArray.length; i += 2) {
+      const ts = csvArray[i];
+      const price = csvArray[i + 1];
+      if (
+        typeof ts === "number" &&
+        typeof price === "number" &&
+        price !== -1 &&
+        ts >= cutoffKeepaMinutes
+      ) {
+        highest = highest == null ? price : Math.max(highest, price);
+      }
+    }
+  }
+  return highest;
+}
+
+// The "was" price used to compute discount_percentage. Genuine tracked MSRP
+// (list price) wins when Keepa has it — but most generic/hardware ASINs
+// (the kind that clear a raw % discount filter easily, e.g. a $2.99 cable)
+// have no MSRP tracked at all. Previously that meant listPriceCents was
+// null and the code fell back straight to dealPrice, which silently drew
+// list_price == deal_price and displayed a fake "-0%" badge on cards that
+// Keepa's Deals API had genuinely flagged as real price drops. Falling back
+// to the recent trading high instead keeps the displayed discount honest
+// and tied to an actual observed price.
+function getReferencePriceCents(product) {
+  const listPriceCents = getListPriceCents(product);
+  if (listPriceCents != null) return listPriceCents;
+  return getRecentHighPriceCents(product);
+}
+
 // Keepa stores rating as (stars * 10), e.g. 45 => 4.5.
 function getRating(product) {
   const raw = product.stats?.current?.[CSV_TYPE.RATING];
@@ -196,6 +454,58 @@ function getRatingCount(product) {
   const raw = product.stats?.current?.[CSV_TYPE.COUNT_REVIEWS];
   if (typeof raw === "number" && raw !== -1) return raw;
   return getLastCsvValue(product.csv?.[CSV_TYPE.COUNT_REVIEWS]);
+}
+
+// Category exclusions (books, DVDs). Keepa's excludeCategories selection
+// field needs numeric per-marketplace category IDs we haven't looked up for
+// Amazon.ca, so this checks category/product-group text instead — safer
+// than guessing at an unverified numeric ID (the same mistake that broke
+// priceTypes earlier). Add more excluded types here as new keyword groups
+// rather than one growing flat list, so the skip message stays specific
+// about which rule actually matched.
+const EXCLUDED_CATEGORY_KEYWORDS = {
+  book: ["book", "ebook", "e-book", "kindle", "audible", "textbook"],
+  dvd: ["dvd", "blu-ray", "bluray", "movies & tv"],
+};
+
+// Returns the excluded-category label ("book"/"dvd") this product matched,
+// or null if it doesn't match any exclusion.
+function getExcludedCategoryLabel(product) {
+  const categoryNames = (product.categoryTree ?? []).map((c) => c.name ?? "");
+  const haystack = [...categoryNames, product.productGroup ?? ""]
+    .join(" ")
+    .toLowerCase();
+
+  for (const [label, keywords] of Object.entries(EXCLUDED_CATEGORY_KEYWORDS)) {
+    if (keywords.some((keyword) => haystack.includes(keyword))) return label;
+  }
+  return null;
+}
+
+// FBA verification. The Amazon Creators API's offersV2 response has no
+// fulfillment-channel field at all (confirmed 2026-08-20 against Amazon's
+// own Creators API docs — DeliveryInfo/IsAmazonFulfilled from the old PA-API
+// was dropped in offersV2), so "is this offer Fulfilled by Amazon" can only
+// be checked from Keepa's own /product `offers` array, which does carry a
+// real per-offer `isFBA` boolean (confirmed against Keepa's official
+// api_backend Offer.java source) — independent of whether Amazon itself is
+// the seller, unlike Keepa's discovery-time `mustHaveAmazonOffer` field.
+// `liveOffersOrder` is Keepa's list of which `offers[]` entries are
+// currently live (the array can also hold historical offers); fall back to
+// treating every returned offer as live if Keepa omits it.
+function hasLiveFbaNewOffer(product) {
+  const offers = product.offers;
+  if (!Array.isArray(offers) || offers.length === 0) return false;
+
+  const liveIndices =
+    Array.isArray(product.liveOffersOrder) && product.liveOffersOrder.length > 0
+      ? product.liveOffersOrder
+      : offers.map((_, i) => i);
+
+  return liveIndices.some((i) => {
+    const offer = offers[i];
+    return offer && offer.isFBA === true && offer.condition === 1; // 1 = New
+  });
 }
 
 // Best-effort category label — Keepa's categoryTree is a breadcrumb array
@@ -425,8 +735,18 @@ async function fetchAmazonListing(asin) {
 async function buildDealPayload(asin) {
   const product = await fetchKeepaProduct(asin);
 
+  // Fail fast on Keepa-only data before spending a Creators API call or a
+  // LinkTwin call on a candidate that can never publish anyway.
+  const excludedCategory = getExcludedCategoryLabel(product);
+  if (excludedCategory) {
+    throw new Error(`${asin}: excluded category (${excludedCategory}) — skipping.`);
+  }
+  if (!hasLiveFbaNewOffer(product)) {
+    throw new Error(`${asin}: no live Fulfilled-by-Amazon New offer found — skipping.`);
+  }
+
   const keepaPriceCents = getCurrentPriceCents(product);
-  const listPriceCents = getListPriceCents(product);
+  const referencePriceCents = getReferencePriceCents(product);
   const { hasCoupon, couponText, promoText, promoCode } =
     mapPromotions(product);
 
@@ -476,11 +796,27 @@ async function buildDealPayload(asin) {
         `API — cannot set deal_price.`
     );
   }
-  const listPrice = centsToDollars(listPriceCents) ?? dealPrice;
+  const listPrice = centsToDollars(referencePriceCents);
   const discountPercentage =
-    dealPrice != null && listPrice != null && listPrice > 0
+    listPrice != null && listPrice > dealPrice
       ? Math.round(((listPrice - dealPrice) / listPrice) * 100)
       : null;
+
+  // Discovery's own discount % can be stale by the time this enrichment
+  // step runs (Keepa updates on a delay, and cheap/generic ASINs often have
+  // no tracked MSRP at all — see getReferencePriceCents). Recompute and
+  // re-verify against MIN_DEAL_DISCOUNT_PERCENT here rather than trusting
+  // the candidate list blindly; publishing a card with a 0%/fake discount
+  // badge is worse than not publishing it. FALLBACK_ASINS aren't
+  // necessarily live deals either, so this can legitimately skip some of
+  // them too — that's the point, not a bug.
+  if (discountPercentage == null || discountPercentage < MIN_DEAL_DISCOUNT_PERCENT) {
+    throw new Error(
+      `${asin}: no verifiable discount of at least ${MIN_DEAL_DISCOUNT_PERCENT}% ` +
+        `(reference price ${listPrice != null ? `$${listPrice}` : "unavailable"} vs deal price ` +
+        `$${dealPrice}) — skipping rather than publish a misleading discount badge.`
+    );
+  }
 
   const rawUrl = `https://www.amazon.ca/dp/${asin}?tag=${AMAZON_AFFILIATE_TAG}`;
   const affiliateUrl = await generateDeepLink(rawUrl);
@@ -553,9 +889,10 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Real Amazon.ca ASINs for pipeline testing — swap for whatever you're
-// tracking, or wire this array up to a scraper/queue later.
-const TEST_ASINS = [
+// Real Amazon.ca ASINs — used only as a fallback if Keepa Deals API
+// discovery comes back empty (API hiccup, filters too strict, etc.), so the
+// pipeline still has something to run against rather than doing nothing.
+const FALLBACK_ASINS = [
   "B09B8V1LZ3", // Echo Dot (5th Gen) — amazon.ca
   "B075CYMYK6", // Instant Pot Duo Plus 9-in-1, 3 Quart — amazon.ca
   "B01N46DBTN", // Kraft Smooth Peanut Butter, 2kg — amazon.ca
@@ -563,10 +900,29 @@ const TEST_ASINS = [
 
 async function main() {
   console.log(
-    `Mega Deals Canada — syncing ${TEST_ASINS.length} test ASIN(s) (Keepa + Amazon Creators API cross-check)...`
+    `Mega Deals Canada — discovering deals via Keepa [mode=${DISCOVERY_MODE}] ` +
+      `(>= ${MIN_DEAL_DISCOUNT_PERCENT}% off, Amazon.ca)...`
   );
 
-  for (const asin of TEST_ASINS) {
+  let asins =
+    DISCOVERY_MODE === "finder"
+      ? await discoverDealAsinsViaProductFinder()
+      : await discoverDealAsins();
+
+  if (asins.length === 0) {
+    console.warn(
+      `  ! Keepa discovery (mode=${DISCOVERY_MODE}) returned no candidates — falling back to ${FALLBACK_ASINS.length} manual ASIN(s).`
+    );
+    asins = FALLBACK_ASINS;
+  } else {
+    console.log(`  Found ${asins.length} candidate deal(s) (capped at DEAL_DISCOVERY_LIMIT=${DEAL_DISCOVERY_LIMIT}).`);
+  }
+
+  console.log(
+    `Syncing ${asins.length} ASIN(s) (Keepa + Amazon Creators API cross-check)...`
+  );
+
+  for (const asin of asins) {
     await syncDeal(asin);
     await sleep(1200); // be polite to Keepa's rate limits between calls
   }
