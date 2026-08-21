@@ -338,6 +338,24 @@ const PRODUCT_FINDER_MAX_SALES_RANK = Number(process.env.PRODUCT_FINDER_MAX_SALE
 
 async function discoverDealAsinsViaProductFinder() {
   const selection = {
+    // Confirmed 2026-08-21 against Keepa's own Product Finder docs
+    // (keepa.com/api-docs/product-finder.html): productType 5 =
+    // VARIATION_PARENT ("product is a parent ASIN. Only sales rank and
+    // variations is set."). A parent ASIN still has a sales rank (and,
+    // per Amazon's shared-review behavior across variations, often a
+    // rating too) even though it has no single price and isn't buyable —
+    // which is exactly why the sales-rank/rating/review-count filters
+    // below were matching so many of them: found live 2026-08-21, ~100%
+    // of one run's raw candidates were parents, wasting a full Keepa
+    // /product (offers+stats) fetch on every one just to reject it.
+    // productType: [0] (STANDARD — "everything accessible") filters
+    // parents out server-side, before any per-ASIN token gets spent, so
+    // this is strictly better than catching them downstream. The runtime
+    // isParentAsin() check in dedupeAsinsByVariantFamily() / buildDealPayload()
+    // stays in place regardless, as defense in depth (and it's still the
+    // only guard at all for DISCOVERY_MODE=deals, which has no equivalent
+    // Product Finder-style field to filter this server-side).
+    productType: [0],
     ...(PRODUCT_FINDER_EXCLUDED_CATEGORIES.length > 0
       ? { categories_exclude: PRODUCT_FINDER_EXCLUDED_CATEGORIES }
       : {}),
@@ -1188,7 +1206,7 @@ async function main() {
     );
     asins = FALLBACK_ASINS;
   } else {
-    console.log(`  Found ${asins.length} candidate deal(s) (capped at DEAL_DISCOVERY_LIMIT=${DEAL_DISCOVERY_LIMIT}).`);
+    console.log(`  Found ${asins.length} candidate deal(s) (capped at DEAL_DISCOVERY_RAW_POOL=${DEAL_DISCOVERY_RAW_POOL}).`);
   }
 
   console.log(`Checking ${asins.length} candidate(s) for duplicate size/color variants...`);
