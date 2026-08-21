@@ -272,11 +272,23 @@ const PRODUCT_FINDER_CATEGORIES = (
 
 const MIN_DEAL_REVIEW_COUNT = Number(process.env.MIN_DEAL_REVIEW_COUNT) || 100;
 
+// Best Sellers Rank ceiling — a low-BSR requirement so a big discount can't
+// alone qualify a product nobody actually buys. Keepa's `current_SALES_lte`
+// filter is an ABSOLUTE rank number, not a percentile — Keepa's API has no
+// "top N% of category" filter to ask for directly, so a true "top 1-5% of
+// category" requirement isn't something this request can express exactly.
+// The practical effect: the same ceiling is stricter in a small category
+// than a huge one (e.g. 30000 is a demanding bar in "Smart Home" but a
+// looser one in all of "Electronics"). Tunable via PRODUCT_FINDER_MAX_SALES_
+// RANK rather than hardcoded so it's easy to tighten per-category by trial
+// once you see what's actually coming through.
+const PRODUCT_FINDER_MAX_SALES_RANK = Number(process.env.PRODUCT_FINDER_MAX_SALES_RANK) || 30000;
+
 async function discoverDealAsinsViaProductFinder() {
   const selection = {
     rootCategory: PRODUCT_FINDER_CATEGORIES,
     current_SALES_gte: 1,
-    current_SALES_lte: 30000,
+    current_SALES_lte: PRODUCT_FINDER_MAX_SALES_RANK,
     // "Percent change from average" over the trailing 90 days — positive
     // means the current price is that much BELOW its own 90-day average, a
     // sustained-discount signal rather than /deal's single-day price-drop
