@@ -1,8 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 import { useOutletContext } from "react-router-dom";
 import { Tag, RefreshCw } from "lucide-react";
 import DealCard from "../components/DealCard";
-import { supabase } from "../lib/supabaseClient";
 
 const SKELETON_COUNT = 10;
 
@@ -48,52 +47,17 @@ function DealCardSkeleton() {
 }
 
 export default function HomePage() {
-  // searchTerm/activeCategory live in Layout (the sticky header) and are
-  // handed down through the route Outlet, since the header renders outside
-  // this page's own component tree.
-  const { searchTerm, activeCategory } = useOutletContext();
-
-  const [deals, setDeals] = useState([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [loadError, setLoadError] = useState(null);
-
-  useEffect(() => {
-    let isCancelled = false;
-
-    async function fetchDeals() {
-      setIsLoading(true);
-      setLoadError(null);
-
-      const { data, error } = await supabase
-        .from("deals")
-        .select("*")
-        .eq("is_active", true)
-        .order("created_at", { ascending: false });
-
-      if (isCancelled) return;
-
-      if (error) {
-        console.error("Failed to fetch deals from Supabase:", error);
-        setLoadError(error.message);
-        setDeals([]);
-      } else {
-        setDeals(data ?? []);
-      }
-      setIsLoading(false);
-    }
-
-    fetchDeals();
-
-    return () => {
-      isCancelled = true;
-    };
-  }, []);
+  // Deals are fetched once in Layout (it needs them too, to build the real
+  // category pills) and handed down here through the route Outlet, along
+  // with the search/category filter state from the header.
+  const { deals, isLoading, loadError, searchTerm, activeCategory } = useOutletContext();
 
   const filteredDeals = useMemo(() => {
     let result = deals;
 
     // "Under $25" is a price filter, not a category — handle it separately
-    // from the rest of the pills, which match against a `category` column.
+    // from the rest of the pills, which match against the real `category`
+    // column values.
     if (activeCategory === "Under $25") {
       result = result.filter((deal) => Number(deal.deal_price) < 25);
     } else if (activeCategory !== "All Deals") {
@@ -113,6 +77,27 @@ export default function HomePage() {
 
     return result;
   }, [deals, searchTerm, activeCategory]);
+
+  // Group filtered deals by `parent_asin` so variants of the same product
+  // (different size/colour/etc, same underlying listing) render as ONE
+  // card with switchable chips instead of duplicate cards. A deal with no
+  // parent_asin falls back to its own asin/id, so it just becomes a
+  // single-item "group" — identical to the one-card-per-row behavior from
+  // before variant grouping existed. Each group is sorted cheapest-first so
+  // the default-shown variant matches the existing "cheapest per family"
+  // convention used elsewhere in this pipeline (see syncDeals.js's
+  // dedupeAsinsByVariantFamily()).
+  const groupedDeals = useMemo(() => {
+    const groups = new Map();
+    for (const deal of filteredDeals) {
+      const groupKey = deal.parent_asin || deal.asin || deal.id;
+      if (!groups.has(groupKey)) groups.set(groupKey, []);
+      groups.get(groupKey).push(deal);
+    }
+    return Array.from(groups.values()).map((group) =>
+      [...group].sort((a, b) => Number(a.deal_price) - Number(b.deal_price))
+    );
+  }, [filteredDeals]);
 
   // "Updated ..." chip mirrors the freshness stamp on deal-roundup sites —
   // driven by the newest created_at actually present in the live data.
@@ -153,7 +138,7 @@ export default function HomePage() {
           )}
           {!isLoading && !loadError && (
             <span className="text-xs font-medium text-gray-500">
-              {filteredDeals.length} deal{filteredDeals.length === 1 ? "" : "s"}
+              {groupedDeals.length} deal{groupedDeals.length === 1 ? "" : "s"}
             </span>
           )}
         </div>
@@ -177,10 +162,10 @@ export default function HomePage() {
             No live deals found. Check back shortly!
           </p>
         </div>
-      ) : filteredDeals.length > 0 ? (
+      ) : groupedDeals.length > 0 ? (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-2 sm:gap-4 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
-          {filteredDeals.map((deal) => (
-            <DealCard key={deal.id} deal={deal} />
+          {groupedDeals.map((group) => (
+            <DealCard key={group[0].id} deals={group} />
           ))}
         </div>
       ) : (

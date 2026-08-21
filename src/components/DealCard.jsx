@@ -16,9 +16,17 @@ import {
 /**
  * DealCard.jsx
  *
- * Renders a single Amazon Canada deal fetched live from Supabase's `deals`
- * table. Column names are snake_case (Postgres convention) and are mapped
- * to display props right at the top of the component.
+ * Renders one product "family" from Supabase's `deals` table — either a
+ * single deal, or a group of variants (different size/colour/etc of the
+ * same underlying product, sharing a `parent_asin`) as ONE card with
+ * switchable chips rather than duplicate cards. Column names are
+ * snake_case (Postgres convention) and are mapped to display props right
+ * at the top of the component.
+ *
+ * `deals` is always an array (HomePage.jsx groups rows by parent_asin,
+ * falling back to a single-item array when a row has no parent_asin —
+ * which is every row today, before the variant-grouping migration/backend
+ * work lands). Whichever variant is selected drives image/price/badges/CTA.
  *
  * Visual language modeled after deal-roundup sites like damgooddeals.ca:
  * a top-right "All-Time Low" badge on the image, a share/save action row,
@@ -89,6 +97,34 @@ function buildBlurb({ brand, title }) {
   return `A top-rated favourite shoppers love — ${shortName || "this pick"} is on sale right now.`;
 }
 
+// variant_attributes is a jsonb column. Confirmed 2026-08-21 by the backend
+// chat: it's an ARRAY of {dimension, value} pairs matching Keepa's own
+// format — e.g. [{"dimension":"Size","value":"4"},{"dimension":"Colour","value":"Black"}]
+// — NOT a plain {key: value} object. (An earlier version of this function
+// explicitly skipped arrays and always fell through to "Option N" for real
+// data — silently wrong, not a crash, but wrong. Fixed here.) Still falls
+// back to a generic "Option N" label if the data is missing/empty/some
+// other shape, so a variant with no variant_attributes still gets a
+// clickable chip instead of disappearing.
+function getVariantLabel(variant, index) {
+  const attrs = variant.variant_attributes;
+
+  if (Array.isArray(attrs)) {
+    const values = attrs
+      .map((entry) => (entry && typeof entry === "object" ? entry.value : null))
+      .filter((value) => value !== null && value !== undefined && value !== "");
+    if (values.length > 0) return values.join(" / ");
+  } else if (attrs && typeof attrs === "object") {
+    // Defensive fallback in case the shape ever changes to a plain object.
+    const values = Object.values(attrs).filter(
+      (value) => value !== null && value !== undefined && value !== ""
+    );
+    if (values.length > 0) return values.join(" / ");
+  }
+
+  return `Option ${index + 1}`;
+}
+
 const BOOKMARKS_STORAGE_KEY = "megaDealsCanada:bookmarks";
 
 function readBookmarks() {
@@ -120,7 +156,12 @@ function Badge({ icon: Icon, label, className }) {
   );
 }
 
-export default function DealCard({ deal }) {
+export default function DealCard({ deals }) {
+  // deals is already sorted cheapest-first by HomePage.jsx, so index 0 is
+  // the sensible default selection.
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const activeDeal = deals[selectedIndex] ?? deals[0];
+
   const {
     id,
     title,
@@ -139,11 +180,14 @@ export default function DealCard({ deal }) {
     last_verified_at: lastVerifiedAt,
     rating,
     review_count: reviewCount,
-  } = deal;
+  } = activeDeal;
 
   const [isBookmarked, setIsBookmarked] = useState(false);
   const [justShared, setJustShared] = useState(false);
 
+  // Re-check bookmark state whenever the *selected variant* changes, since
+  // each variant is its own row with its own id — bookmarking one size
+  // doesn't bookmark the others.
   useEffect(() => {
     setIsBookmarked(readBookmarks().includes(id));
   }, [id]);
@@ -176,6 +220,7 @@ export default function DealCard({ deal }) {
   const verifiedAt = formatRelativeTime(lastVerifiedAt);
   const PromoIcon = pickPromoIcon(promoText);
   const blurb = buildBlurb({ brand, title });
+  const hasVariants = deals.length > 1;
 
   return (
     <div className="group flex flex-col overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-sm transition-shadow duration-200 hover:shadow-lg">
@@ -272,6 +317,33 @@ export default function DealCard({ deal }) {
             {reviewCount ? (
               <span className="text-gray-400">({Number(reviewCount).toLocaleString("en-CA")})</span>
             ) : null}
+          </div>
+        )}
+
+        {/* Variant chips — only rendered when this card actually represents
+            more than one row grouped by parent_asin. Clicking a chip swaps
+            which variant's image/price/badges/CTA are shown, entirely
+            client-side (all variants were already fetched in one query). */}
+        {hasVariants && (
+          <div className="flex flex-wrap gap-1.5">
+            {deals.map((variant, index) => {
+              const isSelected = index === selectedIndex;
+              return (
+                <button
+                  key={variant.id ?? variant.asin ?? index}
+                  type="button"
+                  onClick={() => setSelectedIndex(index)}
+                  aria-pressed={isSelected}
+                  className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold transition-colors duration-150 ${
+                    isSelected
+                      ? "border-red-600 bg-red-600 text-white"
+                      : "border-gray-200 bg-white text-gray-600 hover:border-gray-300"
+                  }`}
+                >
+                  {getVariantLabel(variant, index)}
+                </button>
+              );
+            })}
           </div>
         )}
 
