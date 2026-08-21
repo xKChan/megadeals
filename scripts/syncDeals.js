@@ -345,24 +345,30 @@ async function discoverDealAsinsViaProductFinder() {
     // per Amazon's shared-review behavior across variations, often a
     // rating too) even though it has no single price and isn't buyable —
     // which is exactly why the sales-rank/rating/review-count filters
-    // below were matching so many of them: found live 2026-08-21, ~100%
-    // of one run's raw candidates were parents, wasting a full Keepa
-    // /product (offers+stats) fetch on every one just to reject it.
-    // productType: 0 (STANDARD — "everything accessible") filters parents
-    // out server-side, before any per-ASIN token gets spent, so this is
-    // strictly better than catching them downstream. IMPORTANT: Keepa's
-    // schema defines this field as a single Integer, NOT an array — an
-    // earlier version of this fix sent `productType: [0]`, which Keepa
-    // silently ignored (parents kept flooding through exactly as before,
-    // confirmed live 2026-08-21 by a run still showing ~30/71 raw
-    // candidates as parents post-"fix"). Re-verified against the docs'
-    // schema (`"productType": Integer`) and its one full example query
-    // (plain integers throughout, no arrays) before writing `0` here.
-    // The runtime isParentAsin() check in dedupeAsinsByVariantFamily() /
-    // buildDealPayload() stays in place regardless, as defense in depth
-    // (and it's still the only guard at all for DISCOVERY_MODE=deals,
-    // which has no equivalent Product Finder-style field to filter this
-    // server-side).
+    // below match so many of them.
+    //
+    // productType: 0 (STANDARD) is left in as a best-effort, zero-cost
+    // hint — the field name/type is doc-correct (a plain Integer per
+    // Keepa's schema table, confirmed against their docs; an earlier
+    // version wrongly sent `productType: [0]` as an array). BUT: even with
+    // the correct shape, this filter does NOT reliably keep
+    // VARIATION_PARENT records out of the results — confirmed live
+    // 2026-08-21 across two separate runs *after* deploying the
+    // doc-correct version, one showing 69/69 and another ~30/71 raw
+    // candidates still being true parent ASINs. Keepa's docs never
+    // explicitly promise this filter is enforced server-side, and in
+    // practice it isn't (or isn't reliably). Do not treat this field as a
+    // real guarantee — it may do nothing.
+    //
+    // Because of that, the actual fix for wasted API spend lives in
+    // fetchKeepaProduct()/dedupeAsinsByVariantFamily(): every candidate
+    // gets a cheap parent-check fetch (no offers/stats) before any
+    // candidate pays for the expensive full fetch, so a Product-Finder
+    // response that's mostly parents no longer burns full-price Keepa
+    // calls rejecting them. The runtime isParentAsin() check remains the
+    // one thing actually verified to work, and is the only guard at all
+    // for DISCOVERY_MODE=deals (no Product Finder-style field exists
+    // there to filter server-side either way).
     productType: 0,
     ...(PRODUCT_FINDER_EXCLUDED_CATEGORIES.length > 0
       ? { categories_exclude: PRODUCT_FINDER_EXCLUDED_CATEGORIES }
@@ -454,20 +460,41 @@ const DISCOVERY_MODE = (process.env.DISCOVERY_MODE || "deals").toLowerCase();
 const EXPIRE_REVERIFY_BATCH_SIZE = Number(process.env.EXPIRE_REVERIFY_BATCH_SIZE) || 10;
 const EXPIRE_STALE_HOURS = Number(process.env.EXPIRE_STALE_HOURS) || 48;
 
-async function fetchKeepaProduct(asin) {
+// `full: false` (default true) skips the `offers`/`stats` params — those are
+// the token-expensive parts of a Keepa /product call. `parentAsin` and
+// `variations` (what isParentAsin() checks) are core fields Keepa always
+// returns regardless, at no extra cost. This split exists because Keepa's
+// own Product Finder `productType` selection filter (documented as a plain
+// Integer, values 0=STANDARD/5=VARIATION_PARENT — verified against their
+// docs table, so this isn't a param-shape bug) does NOT reliably keep
+// VARIATION_PARENT records out of the results in practice: confirmed live
+// 2026-08-21 across two separate runs (both after the filter was deployed)
+// that ~90-100% of raw Product Finder candidates were still true parent
+// ASINs. Rather than keep trusting a third-party filter that isn't behaving
+// as documented, the cheap call below lets every candidate get checked for
+// real before paying for the expensive one — so a flood of parent ASINs
+// (which used to each burn a full offers+stats fetch just to be rejected)
+// now only costs the cheap call, no matter how badly Product Finder's
+// server-side filtering performs.
+async function fetchKeepaProduct(asin, { full = true } = {}) {
   const { data } = await axios.get(KEEPA_PRODUCT_URL, {
     params: {
       key: KEEPA_API_KEY,
       domain: KEEPA_DOMAIN_CA,
       asin,
-      offers: 20,
-      // Keepa only computes/returns `product.stats` (current price, list
-      // price, rating, review count — everything getCurrentPriceCents(),
-      // getListPriceCents(), getRating(), and getRatingCount() read) when a
-      // `stats` window is explicitly requested. Omitting it is why
-      // deal_price/list_price/rating all came back null on the first live
-      // run. 180 = compute stats over the trailing 180 days.
-      stats: 180,
+      ...(full
+        ? {
+            offers: 20,
+            // Keepa only computes/returns `product.stats` (current price,
+            // list price, rating, review count — everything
+            // getCurrentPriceCents(), getListPriceCents(), getRating(), and
+            // getRatingCount() read) when a `stats` window is explicitly
+            // requested. Omitting it is why deal_price/list_price/rating
+            // all came back null on the first live run. 180 = compute
+            // stats over the trailing 180 days.
+            stats: 180,
+          }
+        : {}),
     },
   });
 
@@ -893,13 +920,25 @@ async function dedupeAsinsByVariantFamily(asins) {
   const fetched = [];
   for (const asin of asins) {
     try {
-      const product = await fetchKeepaProduct(asin);
-      if (isParentAsin(product)) {
+      // Cheap check first (no offers/stats) — see fetchKeepaProduct() doc
+      // comment for why this exists: Product Finder's own productType
+      // filter doesn't reliably keep parent ASINs out, so every candidate
+      // still needs checking, but there's no reason to pay for offers+stats
+      // on one just to throw it away a moment later.
+      const cheapProduct = await fetchKeepaProduct(asin, { full: false });
+      if (isParentAsin(cheapProduct)) {
         console.warn(
-          `  ! ${asin} is a parent/family ASIN (has ${product.variations.length} variation(s), no single price) — excluding from discovery, not a buyable listing.`
+          `  ! ${asin} is a parent/family ASIN (has ${cheapProduct.variations.length} variation(s), no single price) — excluding from discovery, not a buyable listing.`
         );
+        await sleep(1200);
         continue;
       }
+      // Only survivors get the expensive fetch — this is the actual data
+      // used for price comparison / the eventual deal payload. Rate-limit
+      // pause between the two calls too, since this is a second live Keepa
+      // request for the same ASIN back-to-back.
+      await sleep(1200);
+      const product = await fetchKeepaProduct(asin, { full: true });
       fetched.push({ asin, product });
     } catch (err) {
       console.warn(
