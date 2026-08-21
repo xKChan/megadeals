@@ -40,6 +40,14 @@
  * a real "View Deal" link to land on a size-less "choose your options" page
  * instead of the specific variant shown on the card (found 2026-08-21).
  *
+ * ── EXPIRE sweep (added 2026-08-21) ───────────────────────────────────────
+ * A published deal used to stay is_active: true forever, since discovery
+ * only ever surfaces NEW/recently-dropped candidates. Every run now ends
+ * with refreshStaleActiveDeals() (actively re-verifies the stalest existing
+ * active rows through the full pipeline) and expireStaleDeals() (a cheap
+ * safety-net cutoff). Requires the last_verified_at column — see that
+ * section's own doc comment above main() for the full design/cost notes.
+ *
  * ── Discovery mode (added 2026-08-21) ────────────────────────────────────
  * DISCOVERY_MODE env var picks the discovery source: "deals" (default,
  * discoverDealAsins — Keepa's day-over-day price-drop feed) or "finder"
@@ -390,6 +398,35 @@ async function discoverDealAsinsViaProductFinder() {
 // the file either way, so switching back is a one-line .env.local edit, not
 // a code change or a git operation.
 const DISCOVERY_MODE = (process.env.DISCOVERY_MODE || "deals").toLowerCase();
+
+// ── EXPIRE sweep (added 2026-08-21) ─────────────────────────────────────────
+// Discovery only ever looks at NEW/recently-dropped candidates — a deal that
+// was legitimately published can go stale (price crept back up, went out of
+// stock, coupon expired) without ever showing up in a future discovery batch
+// again, since Keepa's feeds surface drop EVENTS, not "still on sale" status.
+// Left alone, a deal published once stays is_active: true forever. Two-part
+// fix, both run at the end of every sync:
+//   1. refreshStaleActiveDeals() actively re-checks the N stalest currently-
+//      active rows (oldest last_verified_at first) through the exact same
+//      verification pipeline as a new candidate — still discounted enough,
+//      still in stock, still passes every gate? If yes, it's re-upserted
+//      with a fresh last_verified_at. If it throws for any reason, it's
+//      deactivated immediately rather than left silently stale.
+//   2. expireStaleDeals() is a cheap safety net (no API calls, one Supabase
+//      update) that deactivates anything not touched — by discovery OR the
+//      refresh pass — within EXPIRE_STALE_HOURS, catching edge cases (an
+//      ASIN delisted from Keepa entirely, repeated transient errors, etc.).
+// Cost note: refreshStaleActiveDeals() runs full buildDealPayload() per row,
+// including a NEW LinkTwin generateDeepLink() call each time — this is real
+// added API cost per run (Keepa + Creators API + LinkTwin), same trade-off
+// as DEAL_DISCOVERY_RAW_POOL above. Keep EXPIRE_REVERIFY_BATCH_SIZE modest.
+// Tune the two together: if the active-deal count grows faster than
+// EXPIRE_REVERIFY_BATCH_SIZE can cycle through it within EXPIRE_STALE_HOURS,
+// the safety net will start expiring deals that were simply still waiting
+// in the refresh queue, not actually bad — widen the batch size or the
+// stale-hours window (or both) if that starts happening.
+const EXPIRE_REVERIFY_BATCH_SIZE = Number(process.env.EXPIRE_REVERIFY_BATCH_SIZE) || 10;
+const EXPIRE_STALE_HOURS = Number(process.env.EXPIRE_STALE_HOURS) || 48;
 
 async function fetchKeepaProduct(asin) {
   const { data } = await axios.get(KEEPA_PRODUCT_URL, {
@@ -1066,6 +1103,74 @@ const FALLBACK_ASINS = [
   "B01N46DBTN", // Kraft Smooth Peanut Butter, 2kg — amazon.ca
 ];
 
+// Re-verify the stalest currently-active deals through the full pipeline —
+// see the EXPIRE sweep doc comment above for why this exists and its cost.
+async function refreshStaleActiveDeals() {
+  const { data: staleRows, error } = await supabase
+    .from("deals")
+    .select("asin")
+    .eq("is_active", true)
+    .order("last_verified_at", { ascending: true })
+    .limit(EXPIRE_REVERIFY_BATCH_SIZE);
+
+  if (error) {
+    console.warn(`  ! Couldn't fetch stale active deals to re-verify: ${error.message}`);
+    return;
+  }
+  if (!staleRows || staleRows.length === 0) return;
+
+  console.log(
+    `\nRe-verifying ${staleRows.length} existing active deal(s) (oldest last_verified_at first)...`
+  );
+
+  for (const { asin } of staleRows) {
+    try {
+      const payload = await buildDealPayload(asin);
+      const { error: upsertError } = await supabase
+        .from("deals")
+        .upsert(payload, { onConflict: "asin" });
+      if (upsertError) throw upsertError;
+      console.log(`  ✓ Re-verified ${asin} — still a live deal.`);
+    } catch (err) {
+      const message = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+      console.warn(`  ! ${asin} no longer clears the bar (${message}) — deactivating.`);
+      const { error: deactivateError } = await supabase
+        .from("deals")
+        .update({ is_active: false })
+        .eq("asin", asin);
+      if (deactivateError) {
+        console.warn(`  ! Also failed to deactivate ${asin}: ${deactivateError.message}`);
+      }
+    }
+    await sleep(1200);
+  }
+}
+
+// Safety-net sweep — no API calls, just Supabase. Deactivates anything not
+// touched (by discovery or the refresh pass above) within EXPIRE_STALE_HOURS,
+// regardless of the specific reason. See the EXPIRE sweep doc comment above.
+async function expireStaleDeals() {
+  const cutoffIso = new Date(Date.now() - EXPIRE_STALE_HOURS * 60 * 60 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from("deals")
+    .update({ is_active: false })
+    .eq("is_active", true)
+    .lt("last_verified_at", cutoffIso)
+    .select("asin");
+
+  if (error) {
+    console.warn(`  ! EXPIRE safety-net sweep failed: ${error.message}`);
+    return;
+  }
+  if (data && data.length > 0) {
+    console.log(
+      `  Deactivated ${data.length} deal(s) not re-confirmed in over ${EXPIRE_STALE_HOURS}h: ${data
+        .map((d) => d.asin)
+        .join(", ")}`
+    );
+  }
+}
+
 async function main() {
   console.log(
     `Mega Deals Canada — discovering deals via Keepa [mode=${DISCOVERY_MODE}] ` +
@@ -1106,6 +1211,9 @@ async function main() {
     await syncDeal(asin, product);
     await sleep(1200); // be polite to Keepa's rate limits between calls
   }
+
+  await refreshStaleActiveDeals();
+  await expireStaleDeals();
 
   console.log("\nDone.");
 }
