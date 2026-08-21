@@ -35,8 +35,12 @@
  * Both functions live in this file regardless of which is active, so trying
  * "finder" and going back to "deals" is a one-line .env.local edit — no code
  * changes, no lost work either way. See discoverDealAsinsViaProductFinder()
- * for field-by-field notes, including which parts of the category-ID setup
- * are still unverified.
+ * for field-by-field notes. Category scoping uses an EXCLUDE list
+ * (PRODUCT_FINDER_EXCLUDED_CATEGORY_IDS — digital/media categories only,
+ * confirmed 2026-08-21 against a live Amazon.ca category lookup) rather than
+ * an include list — an earlier include-list attempt used wrong IDs and
+ * silently searched only "Sports & Outdoors" instead of the intended
+ * Electronics/Kitchen/Tools/Smart Home.
  *
  * ── Amazon Creators API notes ────────────────────────────────────────────
  * PA-API 5.0 was retired 2026-05-15; the Creators API is its replacement.
@@ -257,14 +261,27 @@ async function discoverDealAsins() {
 // include domain — domain is a separate top-level query param — and the
 // response is a flat { asinList: [...], totalResults } rather than deals.dr.
 //
-// Root category node IDs for Amazon.ca (Electronics, Kitchen & Dining,
-// Tools, Smart Home) are UNVERIFIED — Keepa doesn't error on a wrong numeric
-// category ID, it just silently matches nothing, so `totalResults` logged
-// below is the tell: if it's consistently 0, check these IDs first via
-// Keepa's category browser before assuming a filter elsewhere is at fault.
-// Override via PRODUCT_FINDER_CATEGORY_IDS (comma-separated) in .env.local.
-const PRODUCT_FINDER_CATEGORIES = (
-  process.env.PRODUCT_FINDER_CATEGORY_IDS || "2242989011,2224025011,3379552011,6368817011"
+// Category scoping — CONFIRMED 2026-08-21 against a live lookup of Amazon.ca's
+// real root categories (GET https://api.keepa.com/category?domain=6&category=0,
+// run by the user with their own key). That live data caught a real bug: the
+// original 4 "include" category IDs from the other AI's suggestion were
+// wrong for Amazon.ca — only one (2242989011) was even a valid category on
+// this marketplace, and it's actually "Sports & Outdoors", not "Electronics"
+// as claimed (the other three matched nothing at all). That's why finder
+// mode was only ever returning adidas gear: it was quietly searching Sports
+// & Outdoors alone. Switched approach entirely per the user's follow-up
+// request — instead of guessing at which categories to include, EXCLUDE the
+// ones that are obviously wrong for a physical-product deals site (digital
+// goods, media, subscriptions) and allow everything else. `categories_exclude`
+// is a real Keepa Product Finder field (confirmed earlier); no `rootCategory`
+// include-filter is set, so the whole Amazon.ca catalog is in scope minus
+// these. Override via PRODUCT_FINDER_EXCLUDED_CATEGORY_IDS (comma-separated)
+// in .env.local — defaults to the user-confirmed real IDs for: Alexa Skills,
+// Amazon Appstore, Audible Books & Originals, Books, Kindle Store, Movies &
+// TV, Music, Prime Video, Software.
+const PRODUCT_FINDER_EXCLUDED_CATEGORIES = (
+  process.env.PRODUCT_FINDER_EXCLUDED_CATEGORY_IDS ||
+  "16286269011,6386371011,20037537011,916520,2972705011,917972,916514,18730296011,3198021"
 )
   .split(",")
   .map((id) => Number(id.trim()))
@@ -286,7 +303,9 @@ const PRODUCT_FINDER_MAX_SALES_RANK = Number(process.env.PRODUCT_FINDER_MAX_SALE
 
 async function discoverDealAsinsViaProductFinder() {
   const selection = {
-    rootCategory: PRODUCT_FINDER_CATEGORIES,
+    ...(PRODUCT_FINDER_EXCLUDED_CATEGORIES.length > 0
+      ? { categories_exclude: PRODUCT_FINDER_EXCLUDED_CATEGORIES }
+      : {}),
     current_SALES_gte: 1,
     current_SALES_lte: PRODUCT_FINDER_MAX_SALES_RANK,
     // "Percent change from average" over the trailing 90 days — positive
@@ -301,10 +320,14 @@ async function discoverDealAsinsViaProductFinder() {
     ...(DEAL_BRAND_ALLOWLIST.length > 0 ? { brand: DEAL_BRAND_ALLOWLIST } : {}),
     page: 0,
     perPage: Math.max(DEAL_DISCOVERY_LIMIT, 50),
-    // No categories_exclude for books/DVDs here for the same reason as
-    // /deal — needs numeric IDs we haven't verified. Every candidate this
-    // returns still passes through buildDealPayload()'s excluded-category
-    // and FBA checks (Keepa /product data), so nothing skips those gates.
+    // categories_exclude above covers digital/media categories (books, movies,
+    // music, etc. — see PRODUCT_FINDER_EXCLUDED_CATEGORIES). It doesn't cover
+    // DVDs specifically (Movies & TV is a media category but Amazon files
+    // physical DVDs there too, alongside digital video — excluding the whole
+    // category is intentional and correct here). Every candidate this returns
+    // still passes through buildDealPayload()'s excluded-category and FBA
+    // checks (Keepa /product data) as a second, independent layer — nothing
+    // skips those gates regardless of what discovery already filtered out.
   };
 
   try {
@@ -322,8 +345,7 @@ async function discoverDealAsinsViaProductFinder() {
     }
 
     console.log(
-      `  Product Finder matched ${data.totalResults ?? asinList.length} total product(s) before capping ` +
-        `(0 here usually means PRODUCT_FINDER_CATEGORY_IDS need checking).`
+      `  Product Finder matched ${data.totalResults ?? asinList.length} total product(s) before capping.`
     );
     return asinList.slice(0, DEAL_DISCOVERY_LIMIT);
   } catch (err) {
