@@ -11,7 +11,6 @@ import {
   Share2,
   Bookmark,
   Check,
-  ShieldCheck,
 } from "lucide-react";
 
 /**
@@ -294,15 +293,13 @@ export default function DealCard({ deal }) {
           )}
         </div>
 
-        {/* Amazon Associates compliance: the price above must be shown as
-            verified, not implied live. Deliberately its own visible pill
-            right under the price — not folded into the muted "Added" line —
-            so it can't be missed or mistaken for a marketing badge. */}
+        {/* Small, muted — matches the quiet "Deal found: X ago" convention
+            on reference deal-roundup sites rather than standing out as a
+            marketing badge. Still satisfies Amazon Associates compliance
+            (price shown as verified, not implied live) since it's real,
+            visible text on every card, just not a loud colored pill. */}
         {verifiedAt && (
-          <div className="inline-flex w-fit items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700">
-            <ShieldCheck className="h-3.5 w-3.5" />
-            Price verified {verifiedAt}
-          </div>
+          <span className="text-[11px] text-gray-400">Price verified {verifiedAt}</span>
         )}
 
         {blurb && <p className="line-clamp-2 text-xs leading-snug text-gray-500">{blurb}</p>}
