@@ -27,18 +27,41 @@
  * buildDealPayload() from real per-offer Keepa data, not at discovery time
  * — see getExcludedCategoryLabel() / hasLiveFbaNewOffer() below for why.
  *
- * ── Variant de-duplication (added 2026-08-21) ────────────────────────────
+ * ── Variant family expansion (added 2026-08-21, rewritten same day) ──────
  * Amazon color/size variants of one physical product are separate ASINs, so
- * discovery can surface several "deals" that are really the same item. After
- * discovery, dedupeAsinsByVariantFamily() groups candidates by Keepa's
- * parentAsin field and keeps only the cheapest variant per group before the
- * costlier Creators API/LinkTwin calls run. See that function for details —
- * this is a discovery-time fix; already-published duplicate rows aren't
- * retroactively touched. The same pass also rejects actual parent/family
- * ASINs outright (isParentAsin(), re-checked again in buildDealPayload()) —
- * those have no single price and no buyable /dp/ page, which is what caused
- * a real "View Deal" link to land on a size-less "choose your options" page
- * instead of the specific variant shown on the card (found 2026-08-21).
+ * discovery can surface several "deals" that are really the same item — and
+ * separately, Keepa's discovery endpoints (both /deal and Product Finder)
+ * disproportionately surface the parent/family ASIN itself rather than a
+ * buyable child (confirmed live: runs where 17/20, 30/71, even 69/69 raw
+ * candidates were parent records). The first version of this fix just
+ * rejected parent ASINs outright — correct (a parent has no single price
+ * and no buyable /dp/ page, which is what caused a real "View Deal" link to
+ * land on a size-less "choose your options" page instead of the specific
+ * variant shown on the card), but wasteful: it threw away every family
+ * Keepa found instead of asking "does *any* size/colour in this family
+ * actually qualify as a deal?" — which is usually yes.
+ *
+ * dedupeAsinsByVariantFamily() now does that instead: when a raw candidate
+ * is a true parent ASIN, its `variations` list (free — Keepa returns it on
+ * any fetch of the parent, no extra call) becomes a new batch of child
+ * candidates, each price-checked up to MAX_VARIANTS_TO_CHECK_PER_FAMILY.
+ * Every child that clears the full buildDealPayload() pipeline (discount
+ * floor, live FBA offer, Creators API cross-check, etc. — unchanged, each
+ * variant goes through the exact same per-ASIN verification a standalone
+ * deal would) gets published as its OWN row, tagged with a shared
+ * `parent_asin` column so the frontend can group same-family rows onto one
+ * card (e.g. "Size 3" and "Size 4" both available, "Size 5" omitted because
+ * it didn't clear MIN_DEAL_DISCOUNT_PERCENT) and a `variant_attributes`
+ * jsonb column (Keepa's own dimension/value pairs, e.g. [{"dimension":
+ * "Size","value":"4"}]) for the human-readable label. Both columns are
+ * nullable and omitted from the payload entirely for a standalone
+ * (non-family) deal or during the EXPIRE sweep's re-verify pass (which
+ * doesn't re-resolve family context) — Supabase upsert only touches columns
+ * present in the payload, so omitting them preserves whatever was already
+ * stored rather than wiping it to null. Requires two new nullable columns
+ * on `deals` (parent_asin text, variant_attributes jsonb) — see the
+ * migration note in ROADMAP.md. This is a discovery-time fix;
+ * already-published duplicate rows aren't retroactively touched or merged.
  *
  * ── EXPIRE sweep (added 2026-08-21) ───────────────────────────────────────
  * A published deal used to stay is_active: true forever, since discovery
@@ -202,6 +225,18 @@ const DEAL_DISCOVERY_LIMIT = Number(process.env.DEAL_DISCOVERY_LIMIT) || 20;
 // isParentAsin), so dial it back if Keepa's rate limits start complaining.
 const DEAL_DISCOVERY_RAW_POOL =
   Number(process.env.DEAL_DISCOVERY_RAW_POOL) || DEAL_DISCOVERY_LIMIT * 4;
+
+// How many sibling ASINs to price-check when a discovered candidate turns
+// out to be a parent/family ASIN (added 2026-08-21 — see the "Variant
+// family expansion" doc section above main() for the full design). A
+// family can have anywhere from 2 to 900+ variations (both seen live), and
+// each one checked costs a full Keepa /product (offers+stats) fetch, so
+// this caps the worst case rather than checking all of them. Tunable —
+// raise it to surface more simultaneously-qualifying size/colour options
+// per family at the cost of more Keepa spend on families that turn out to
+// have only one or two real deals buried in a big variation list.
+const MAX_VARIANTS_TO_CHECK_PER_FAMILY =
+  Number(process.env.MAX_VARIANTS_TO_CHECK_PER_FAMILY) || 25;
 
 // Minimum product star rating (0-5). Keepa's own `minRating` selection field
 // uses a 0-50 integer scale (45 = 4.5 stars, confirmed against Keepa's docs
@@ -882,105 +917,192 @@ async function fetchAmazonListing(asin) {
   };
 }
 
-// ── Variant de-duplication (added 2026-08-21) ───────────────────────────────
+// ── Variant family expansion (added 2026-08-21, rewritten same day) ────────
 // Amazon color/size options of the same physical product are separate ASINs
 // — Keepa (and Amazon) treat "adidas soccer ball, size 3" and "...size 4" as
 // two entirely different products, each with its own price/discount, so
 // discovery can legitimately surface several of them for what a shopper
-// sees as ONE item. That's the duplicate-card bug.
+// sees as ONE item.
 //
 // Keepa's `parentAsin` field is the real "these are the same underlying
 // product" signal — confirmed against Keepa's own api_backend source
 // (https://github.com/keepacom/api_backend, Product.java): "The ASIN of the
-// parent product (if the product has variations, otherwise null)". This
-// groups candidates by parentAsin (falling back to the ASIN itself for a
-// product with no variation family at all) and keeps only the cheapest
-// variant per group — the best deal for the customer, and it means only one
-// card gets published per physical product. This runs BEFORE the costlier
-// Creators API + LinkTwin calls in buildDealPayload(), so a squashed
-// duplicate never spends that budget.
+// parent product (if the product has variations, otherwise null)".
+// dedupeAsinsByVariantFamily() groups candidates by parentAsin and, as of
+// this rewrite, PUBLISHES every sibling that independently clears the full
+// deal pipeline (discount floor, live FBA offer, Creators API cross-check —
+// same gates a standalone deal goes through, nothing skipped) as its own
+// row, tagged with a shared `parent_asin` column. The frontend groups
+// same-family rows onto one card — e.g. "Size 3" and "Size 4" both shown as
+// available, "Size 5" simply never published because it didn't clear
+// MIN_DEAL_DISCOUNT_PERCENT. The first version of this (same day) picked
+// only the single cheapest variant per family and discarded the rest —
+// changed because the actual ask is "show every size/colour that's
+// genuinely on sale", not "collapse to one".
 //
 // This is a discovery-time fix, not retroactive: duplicate variant rows
 // already published from earlier runs stay in Supabase (is_active: true)
 // until re-synced or manually cleaned up — same caveat as the two pre-fix
 // junk rows noted in ROADMAP.md.
-// A parent/family ASIN (Keepa's `variations` array is only ever populated
-// on parent ASINs — confirmed against the same api_backend source as
-// parentAsin above) has no single buyable price and no single Amazon
-// listing — its /dp/ page is the "choose your options" page with a price
-// RANGE, exactly what showed up when a deal link didn't land on a specific
-// size (found 2026-08-21: a real deal's rawUrl resolved to a parent ASIN
-// via Keepa discovery, which is why the affiliate link didn't preselect
-// anything). Parent ASINs must never be published as a deal.
+//
+// A parent/family ASIN itself (Keepa's `variations` array is only ever
+// populated on parent ASINs — confirmed against the same api_backend source
+// as parentAsin above) has no single buyable price and no single Amazon
+// listing of its own — its /dp/ page is the "choose your options" page with
+// a price RANGE, exactly what showed up when a deal link didn't land on a
+// specific size (found 2026-08-21: a real deal's rawUrl resolved to a
+// parent ASIN via Keepa discovery, which is why the affiliate link didn't
+// preselect anything). The parent record itself must never be published as
+// a deal — but per the above, its family is now expanded into real children
+// rather than the whole family being discarded.
 function isParentAsin(product) {
   return Array.isArray(product.variations) && product.variations.length > 0;
 }
 
 async function dedupeAsinsByVariantFamily(asins) {
-  const fetched = [];
+  const seenAsins = new Set();
+
+  // Pass 1: cheap-check every raw candidate (no offers/stats — just enough
+  // to see parentAsin/variations, both core fields Keepa always returns
+  // regardless). See fetchKeepaProduct() doc comment for why this exists:
+  // Product Finder's own productType filter doesn't reliably keep parent
+  // ASINs out, so every candidate still needs checking, but there's no
+  // reason to pay for offers+stats on one just to inspect its family shape.
+  const cheapChecked = [];
   for (const asin of asins) {
+    if (seenAsins.has(asin)) continue;
+    seenAsins.add(asin);
     try {
-      // Cheap check first (no offers/stats) — see fetchKeepaProduct() doc
-      // comment for why this exists: Product Finder's own productType
-      // filter doesn't reliably keep parent ASINs out, so every candidate
-      // still needs checking, but there's no reason to pay for offers+stats
-      // on one just to throw it away a moment later.
       const cheapProduct = await fetchKeepaProduct(asin, { full: false });
-      if (isParentAsin(cheapProduct)) {
-        console.warn(
-          `  ! ${asin} is a parent/family ASIN (has ${cheapProduct.variations.length} variation(s), no single price) — excluding from discovery, not a buyable listing.`
-        );
-        await sleep(1200);
-        continue;
-      }
-      // Only survivors get the expensive fetch — this is the actual data
-      // used for price comparison / the eventual deal payload. Rate-limit
-      // pause between the two calls too, since this is a second live Keepa
-      // request for the same ASIN back-to-back.
-      await sleep(1200);
-      const product = await fetchKeepaProduct(asin, { full: true });
-      fetched.push({ asin, product });
+      cheapChecked.push({ asin, cheapProduct });
     } catch (err) {
       console.warn(
         `  ! Couldn't fetch Keepa product for ${asin} during variant dedup: ${err.message}`
       );
     }
-    await sleep(1200); // same Keepa rate-limit courtesy as the main sync loop
+    await sleep(1200);
   }
 
-  const groups = new Map(); // groupKey (parentAsin or standalone asin) -> [{asin, product}, ...]
-  for (const entry of fetched) {
-    const groupKey = entry.product.parentAsin || entry.asin;
-    if (!groups.has(groupKey)) groups.set(groupKey, []);
-    groups.get(groupKey).push(entry);
-  }
+  // Pass 2: build the list of candidates that actually need a full
+  // (price-bearing) fetch — either a raw candidate itself, or a family's
+  // children when the raw candidate turned out to be the parent.
+  const toCheckFull = []; // [{asin, familyAsin, variantAttributes}, ...]
+  const bareChildrenByParent = new Map(); // parentAsin -> [{asin}, ...] (children found directly, not via a parent hit)
 
-  const winners = [];
-  for (const [groupKey, entries] of groups.entries()) {
-    if (entries.length > 1) {
-      const variantAsins = entries.map((e) => e.asin).join(", ");
+  for (const { asin, cheapProduct } of cheapChecked) {
+    if (isParentAsin(cheapProduct)) {
+      // A true parent ASIN — instead of discarding the whole family (the
+      // first version of this fix), fan out into its real children.
+      // `variations[].attributes` (the "Size: 4" style label) comes free
+      // with this same fetch — only each child's own price needs a further
+      // call. See MAX_VARIANTS_TO_CHECK_PER_FAMILY doc comment above.
+      const total = cheapProduct.variations.length;
+      const variations = cheapProduct.variations.slice(0, MAX_VARIANTS_TO_CHECK_PER_FAMILY);
       console.log(
-        `  Grouped ${entries.length} variant ASIN(s) under parent ${groupKey} (${variantAsins}) — publishing the cheapest one only.`
+        `  ${asin} is a parent ASIN with ${total} variation(s) — checking ` +
+          `${variations.length === total ? "all of them" : `the first ${variations.length} (MAX_VARIANTS_TO_CHECK_PER_FAMILY)`} ` +
+          `for a live deal instead of discarding the family.`
       );
+      for (const variation of variations) {
+        if (!variation?.asin || seenAsins.has(variation.asin)) continue;
+        seenAsins.add(variation.asin);
+        toCheckFull.push({
+          asin: variation.asin,
+          familyAsin: asin,
+          variantAttributes: variation.attributes ?? null,
+        });
+      }
+      continue; // the parent record itself never gets checked/published
     }
-    const cheapest = entries.reduce((best, e) => {
-      const price = getCurrentPriceCents(e.product);
-      const bestPrice = getCurrentPriceCents(best.product);
-      if (price == null) return best;
-      if (bestPrice == null) return e;
-      return price < bestPrice ? e : best;
-    }, entries[0]);
-    winners.push(cheapest);
+
+    if (cheapProduct.parentAsin) {
+      // A real child, discovered directly rather than via its parent — the
+      // original "duplicate soccer ball cards" scenario when 2+ of these
+      // share a parentAsin. Queue it for the shared-parent label lookup
+      // below rather than looking it up per-candidate.
+      const list = bareChildrenByParent.get(cheapProduct.parentAsin) ?? [];
+      list.push(asin);
+      bareChildrenByParent.set(cheapProduct.parentAsin, list);
+    } else {
+      // Standalone — no family at all.
+      toCheckFull.push({ asin, familyAsin: null, variantAttributes: null });
+    }
   }
 
-  return winners; // [{asin, product}, ...] — product already fetched, reused downstream
+  // Pass 2b: for any parentAsin with 2+ bare children in this batch, one
+  // cheap fetch of the shared parent gets real "Size 4" style labels for
+  // the whole group. A lone bare child (no sibling surfaced this run) isn't
+  // worth an extra call for — it still gets its parent_asin set correctly
+  // (that's read straight off its own record, not this lookup), just
+  // without a label; a future run that surfaces a sibling — or the parent
+  // itself — fills the label in then via upsert, nothing is lost.
+  for (const [parentAsin, memberAsins] of bareChildrenByParent.entries()) {
+    let labelByAsin = null;
+    if (memberAsins.length > 1) {
+      try {
+        await sleep(1200);
+        const parentProduct = await fetchKeepaProduct(parentAsin, { full: false });
+        if (Array.isArray(parentProduct.variations)) {
+          labelByAsin = new Map(
+            parentProduct.variations.map((v) => [v.asin, v.attributes ?? null])
+          );
+        }
+      } catch (err) {
+        console.warn(
+          `  ! Couldn't fetch parent ${parentAsin} for variant labels: ${err.message}`
+        );
+      }
+    }
+    for (const asin of memberAsins) {
+      toCheckFull.push({
+        asin,
+        familyAsin: parentAsin,
+        variantAttributes: labelByAsin?.get(asin) ?? null,
+      });
+    }
+  }
+
+  // Pass 3: the full (offers+stats) fetch — the actual data used for price/
+  // discount and the eventual deal payload — for every survivor, expanded
+  // children and bare/standalone candidates alike.
+  const results = []; // [{asin, product, familyAsin, variantAttributes}, ...]
+  for (const entry of toCheckFull) {
+    try {
+      await sleep(1200); // rate-limit pause before each full fetch
+      const product = await fetchKeepaProduct(entry.asin, { full: true });
+      if (isParentAsin(product)) {
+        // Shouldn't happen — Keepa's model has `variations` only ever
+        // populated on the parent, never on a child — but stay defensive.
+        console.warn(
+          `  ! ${entry.asin} unexpectedly has its own variations — skipping.`
+        );
+        continue;
+      }
+      results.push({ ...entry, product });
+    } catch (err) {
+      console.warn(`  ! Couldn't fetch Keepa product for ${entry.asin}: ${err.message}`);
+    }
+  }
+
+  return results;
 }
 
 // ── Build + upsert one deal ─────────────────────────────────────────────────
 // `prefetchedProduct` lets callers that already fetched Keepa product data
 // (the variant-dedup pass above) reuse it instead of spending a second
 // Keepa /product call on the same ASIN.
-async function buildDealPayload(asin, prefetchedProduct = null) {
+//
+// `variantMeta` (added 2026-08-21) carries family context from
+// dedupeAsinsByVariantFamily(): { familyAsin, variantAttributes } — set
+// only when discovery resolved this ASIN as part of a variant family this
+// run. Deliberately left null/omitted rather than passed for the EXPIRE
+// sweep's re-verify calls (see refreshStaleActiveDeals()), which don't
+// re-resolve family context — the returned payload only includes
+// parent_asin/variant_attributes as keys when variantMeta provides them, so
+// a re-verify upsert (which omits these keys entirely) never overwrites a
+// row's existing family tag with null. See the "Variant family expansion"
+// doc section near the top of this file for the full design.
+async function buildDealPayload(asin, prefetchedProduct = null, variantMeta = null) {
   const product = prefetchedProduct || (await fetchKeepaProduct(asin));
 
   // Fail fast on Keepa-only data before spending a Creators API call or a
@@ -1096,7 +1218,10 @@ async function buildDealPayload(asin, prefetchedProduct = null) {
 
   // Column names below match the `deals` table exactly — keep this object's
   // keys in lockstep with the schema; Supabase's PostgREST layer rejects any
-  // key it can't find a matching column for.
+  // key it can't find a matching column for. (parent_asin/variant_attributes
+  // are the one exception — conditionally spread in further down, see the
+  // buildDealPayload() doc comment above for why they're sometimes omitted
+  // entirely rather than always present.)
   return {
     asin,
     title: product.title ?? null,
@@ -1128,13 +1253,23 @@ async function buildDealPayload(asin, prefetchedProduct = null) {
     // of implying every displayed price is live. Requires a `last_verified_at`
     // timestamptz column on `deals` — see the migration note in ROADMAP.md.
     last_verified_at: new Date().toISOString(),
+    // Variant family expansion (see doc section near the top of this file
+    // and the buildDealPayload() doc comment above) — conditionally
+    // included ONLY when variantMeta was actually passed in, so a re-verify
+    // upsert that omits variantMeta never blanks out an existing tag.
+    // Requires two new nullable columns on `deals`: parent_asin (text),
+    // variant_attributes (jsonb) — see the migration note in ROADMAP.md.
+    ...(variantMeta?.familyAsin ? { parent_asin: variantMeta.familyAsin } : {}),
+    ...(variantMeta?.variantAttributes
+      ? { variant_attributes: variantMeta.variantAttributes }
+      : {}),
   };
 }
 
-async function syncDeal(asin, prefetchedProduct = null) {
+async function syncDeal(asin, prefetchedProduct = null, variantMeta = null) {
   console.log(`\n→ Syncing ${asin}...`);
   try {
-    const payload = await buildDealPayload(asin, prefetchedProduct);
+    const payload = await buildDealPayload(asin, prefetchedProduct, variantMeta);
     const { error } = await supabase
       .from("deals")
       .upsert(payload, { onConflict: "asin" });
@@ -1272,8 +1407,9 @@ async function main() {
     `Syncing ${toSync.length} ASIN(s) (Keepa + Amazon Creators API cross-check)...`
   );
 
-  for (const { asin, product } of toSync) {
-    await syncDeal(asin, product);
+  for (const { asin, product, familyAsin, variantAttributes } of toSync) {
+    const variantMeta = familyAsin ? { familyAsin, variantAttributes } : null;
+    await syncDeal(asin, product, variantMeta);
     await sleep(1200); // be polite to Keepa's rate limits between calls
   }
 
