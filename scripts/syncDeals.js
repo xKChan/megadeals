@@ -27,6 +27,19 @@
  * buildDealPayload() from real per-offer Keepa data, not at discovery time
  * — see getExcludedCategoryLabel() / hasLiveFbaNewOffer() below for why.
  *
+ * ── Variant de-duplication (added 2026-08-21) ────────────────────────────
+ * Amazon color/size variants of one physical product are separate ASINs, so
+ * discovery can surface several "deals" that are really the same item. After
+ * discovery, dedupeAsinsByVariantFamily() groups candidates by Keepa's
+ * parentAsin field and keeps only the cheapest variant per group before the
+ * costlier Creators API/LinkTwin calls run. See that function for details —
+ * this is a discovery-time fix; already-published duplicate rows aren't
+ * retroactively touched. The same pass also rejects actual parent/family
+ * ASINs outright (isParentAsin(), re-checked again in buildDealPayload()) —
+ * those have no single price and no buyable /dp/ page, which is what caused
+ * a real "View Deal" link to land on a size-less "choose your options" page
+ * instead of the specific variant shown on the card (found 2026-08-21).
+ *
  * ── Discovery mode (added 2026-08-21) ────────────────────────────────────
  * DISCOVERY_MODE env var picks the discovery source: "deals" (default,
  * discoverDealAsins — Keepa's day-over-day price-drop feed) or "finder"
@@ -765,12 +778,111 @@ async function fetchAmazonListing(asin) {
   };
 }
 
+// ── Variant de-duplication (added 2026-08-21) ───────────────────────────────
+// Amazon color/size options of the same physical product are separate ASINs
+// — Keepa (and Amazon) treat "adidas soccer ball, size 3" and "...size 4" as
+// two entirely different products, each with its own price/discount, so
+// discovery can legitimately surface several of them for what a shopper
+// sees as ONE item. That's the duplicate-card bug.
+//
+// Keepa's `parentAsin` field is the real "these are the same underlying
+// product" signal — confirmed against Keepa's own api_backend source
+// (https://github.com/keepacom/api_backend, Product.java): "The ASIN of the
+// parent product (if the product has variations, otherwise null)". This
+// groups candidates by parentAsin (falling back to the ASIN itself for a
+// product with no variation family at all) and keeps only the cheapest
+// variant per group — the best deal for the customer, and it means only one
+// card gets published per physical product. This runs BEFORE the costlier
+// Creators API + LinkTwin calls in buildDealPayload(), so a squashed
+// duplicate never spends that budget.
+//
+// This is a discovery-time fix, not retroactive: duplicate variant rows
+// already published from earlier runs stay in Supabase (is_active: true)
+// until re-synced or manually cleaned up — same caveat as the two pre-fix
+// junk rows noted in ROADMAP.md.
+// A parent/family ASIN (Keepa's `variations` array is only ever populated
+// on parent ASINs — confirmed against the same api_backend source as
+// parentAsin above) has no single buyable price and no single Amazon
+// listing — its /dp/ page is the "choose your options" page with a price
+// RANGE, exactly what showed up when a deal link didn't land on a specific
+// size (found 2026-08-21: a real deal's rawUrl resolved to a parent ASIN
+// via Keepa discovery, which is why the affiliate link didn't preselect
+// anything). Parent ASINs must never be published as a deal.
+function isParentAsin(product) {
+  return Array.isArray(product.variations) && product.variations.length > 0;
+}
+
+async function dedupeAsinsByVariantFamily(asins) {
+  const fetched = [];
+  for (const asin of asins) {
+    try {
+      const product = await fetchKeepaProduct(asin);
+      if (isParentAsin(product)) {
+        console.warn(
+          `  ! ${asin} is a parent/family ASIN (has ${product.variations.length} variation(s), no single price) — excluding from discovery, not a buyable listing.`
+        );
+        continue;
+      }
+      fetched.push({ asin, product });
+    } catch (err) {
+      console.warn(
+        `  ! Couldn't fetch Keepa product for ${asin} during variant dedup: ${err.message}`
+      );
+    }
+    await sleep(1200); // same Keepa rate-limit courtesy as the main sync loop
+  }
+
+  const groups = new Map(); // groupKey (parentAsin or standalone asin) -> [{asin, product}, ...]
+  for (const entry of fetched) {
+    const groupKey = entry.product.parentAsin || entry.asin;
+    if (!groups.has(groupKey)) groups.set(groupKey, []);
+    groups.get(groupKey).push(entry);
+  }
+
+  const winners = [];
+  for (const [groupKey, entries] of groups.entries()) {
+    if (entries.length > 1) {
+      const variantAsins = entries.map((e) => e.asin).join(", ");
+      console.log(
+        `  Grouped ${entries.length} variant ASIN(s) under parent ${groupKey} (${variantAsins}) — publishing the cheapest one only.`
+      );
+    }
+    const cheapest = entries.reduce((best, e) => {
+      const price = getCurrentPriceCents(e.product);
+      const bestPrice = getCurrentPriceCents(best.product);
+      if (price == null) return best;
+      if (bestPrice == null) return e;
+      return price < bestPrice ? e : best;
+    }, entries[0]);
+    winners.push(cheapest);
+  }
+
+  return winners; // [{asin, product}, ...] — product already fetched, reused downstream
+}
+
 // ── Build + upsert one deal ─────────────────────────────────────────────────
-async function buildDealPayload(asin) {
-  const product = await fetchKeepaProduct(asin);
+// `prefetchedProduct` lets callers that already fetched Keepa product data
+// (the variant-dedup pass above) reuse it instead of spending a second
+// Keepa /product call on the same ASIN.
+async function buildDealPayload(asin, prefetchedProduct = null) {
+  const product = prefetchedProduct || (await fetchKeepaProduct(asin));
 
   // Fail fast on Keepa-only data before spending a Creators API call or a
   // LinkTwin call on a candidate that can never publish anyway.
+  //
+  // Redundant with the same check in dedupeAsinsByVariantFamily() by design
+  // (defense in depth, same pattern as the discount-floor re-check below) —
+  // this catches a parent/family ASIN even if it reached buildDealPayload()
+  // through a path that skipped dedup (e.g. FALLBACK_ASINS). A parent ASIN
+  // has no single price and its /dp/ link can't preselect a variant — found
+  // 2026-08-21 as the actual cause of "View Deal" landing on a "choose your
+  // options" page instead of the specific size/color shown on the card.
+  if (isParentAsin(product)) {
+    throw new Error(
+      `${asin}: this is a parent/family ASIN (${product.variations.length} variation(s), no single price) — not a buyable listing, skipping.`
+    );
+  }
+
   const excludedCategory = getExcludedCategoryLabel(product);
   if (excludedCategory) {
     throw new Error(`${asin}: excluded category (${excludedCategory}) — skipping.`);
@@ -895,10 +1007,10 @@ async function buildDealPayload(asin) {
   };
 }
 
-async function syncDeal(asin) {
+async function syncDeal(asin, prefetchedProduct = null) {
   console.log(`\n→ Syncing ${asin}...`);
   try {
-    const payload = await buildDealPayload(asin);
+    const payload = await buildDealPayload(asin, prefetchedProduct);
     const { error } = await supabase
       .from("deals")
       .upsert(payload, { onConflict: "asin" });
@@ -952,12 +1064,18 @@ async function main() {
     console.log(`  Found ${asins.length} candidate deal(s) (capped at DEAL_DISCOVERY_LIMIT=${DEAL_DISCOVERY_LIMIT}).`);
   }
 
+  console.log(`Checking ${asins.length} candidate(s) for duplicate size/color variants...`);
+  const deduped = await dedupeAsinsByVariantFamily(asins);
   console.log(
-    `Syncing ${asins.length} ASIN(s) (Keepa + Amazon Creators API cross-check)...`
+    `  ${deduped.length} unique product(s) after variant grouping (was ${asins.length} candidate(s)).`
   );
 
-  for (const asin of asins) {
-    await syncDeal(asin);
+  console.log(
+    `Syncing ${deduped.length} ASIN(s) (Keepa + Amazon Creators API cross-check)...`
+  );
+
+  for (const { asin, product } of deduped) {
+    await syncDeal(asin, product);
     await sleep(1200); // be polite to Keepa's rate limits between calls
   }
 

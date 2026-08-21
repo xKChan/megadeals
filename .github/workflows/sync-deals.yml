@@ -1,0 +1,65 @@
+name: Sync Deals
+
+# Runs scripts/syncDeals.js on a schedule so the site's Supabase `deals`
+# table stays fresh without anyone running it by hand. Reuses the exact
+# same Node script as local runs -- no separate pipeline to maintain.
+#
+# Requires these repo secrets (Settings -> Secrets and variables -> Actions
+# -> New repository secret) -- same names/values as your local .env.local:
+#   KEEPA_API_KEY, AMAZON_AFFILIATE_TAG, LINKTWIN_API_KEY, VITE_SUPABASE_URL,
+#   VITE_SUPABASE_SECRET_KEY, AMAZON_CREDENTIAL_ID, AMAZON_CREDENTIAL_SECRET,
+#   AMAZON_CREDENTIAL_VERSION, AMAZON_MARKETPLACE
+# Without these, syncDeals.js's own requireEnv() check fails fast with a
+# clear "Missing required env vars" list in the run log -- not a silent
+# no-op.
+#
+# All other env vars the script reads (DISCOVERY_MODE, DEAL_DISCOVERY_LIMIT,
+# MIN_DEAL_DISCOUNT_PERCENT, etc.) have safe defaults baked into the code --
+# only add them below as repo Variables if you want to override a default
+# without touching code.
+
+on:
+  schedule:
+    - cron: "0 * * * *" # every hour, on the hour (UTC) -- GitHub may delay a
+    # run slightly under load; scheduled workflows also auto-disable after
+    # 60 days with zero commits to the repo (a GitHub platform limit, not
+    # something this workflow controls) -- a push re-enables it.
+  workflow_dispatch: {} # adds a manual "Run workflow" button in the Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Sync deals
+        run: npm run sync-deals
+        env:
+          KEEPA_API_KEY: ${{ secrets.KEEPA_API_KEY }}
+          AMAZON_AFFILIATE_TAG: ${{ secrets.AMAZON_AFFILIATE_TAG }}
+          LINKTWIN_API_KEY: ${{ secrets.LINKTWIN_API_KEY }}
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_SECRET_KEY: ${{ secrets.VITE_SUPABASE_SECRET_KEY }}
+          AMAZON_CREDENTIAL_ID: ${{ secrets.AMAZON_CREDENTIAL_ID }}
+          AMAZON_CREDENTIAL_SECRET: ${{ secrets.AMAZON_CREDENTIAL_SECRET }}
+          AMAZON_CREDENTIAL_VERSION: ${{ secrets.AMAZON_CREDENTIAL_VERSION }}
+          AMAZON_MARKETPLACE: ${{ secrets.AMAZON_MARKETPLACE }}
+          # Optional tuning knobs -- uncomment and add as repo Variables
+          # (Settings -> Secrets and variables -> Actions -> Variables tab)
+          # only if you want to override a default without a code change:
+          # DISCOVERY_MODE: ${{ vars.DISCOVERY_MODE }}
+          # MIN_DEAL_DISCOUNT_PERCENT: ${{ vars.MIN_DEAL_DISCOUNT_PERCENT }}
+          # DEAL_DISCOVERY_LIMIT: ${{ vars.DEAL_DISCOVERY_LIMIT }}
+          # MIN_DEAL_RATING_STARS: ${{ vars.MIN_DEAL_RATING_STARS }}
+          # DEAL_BRAND_ALLOWLIST: ${{ vars.DEAL_BRAND_ALLOWLIST }}
+          # MIN_DEAL_REVIEW_COUNT: ${{ vars.MIN_DEAL_REVIEW_COUNT }}
+          # PRODUCT_FINDER_MAX_SALES_RANK: ${{ vars.PRODUCT_FINDER_MAX_SALES_RANK }}
+          # PRODUCT_FINDER_EXCLUDED_CATEGORY_IDS: ${{ vars.PRODUCT_FINDER_EXCLUDED_CATEGORY_IDS }}
