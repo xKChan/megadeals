@@ -348,14 +348,22 @@ async function discoverDealAsinsViaProductFinder() {
     // below were matching so many of them: found live 2026-08-21, ~100%
     // of one run's raw candidates were parents, wasting a full Keepa
     // /product (offers+stats) fetch on every one just to reject it.
-    // productType: [0] (STANDARD — "everything accessible") filters
-    // parents out server-side, before any per-ASIN token gets spent, so
-    // this is strictly better than catching them downstream. The runtime
-    // isParentAsin() check in dedupeAsinsByVariantFamily() / buildDealPayload()
-    // stays in place regardless, as defense in depth (and it's still the
-    // only guard at all for DISCOVERY_MODE=deals, which has no equivalent
-    // Product Finder-style field to filter this server-side).
-    productType: [0],
+    // productType: 0 (STANDARD — "everything accessible") filters parents
+    // out server-side, before any per-ASIN token gets spent, so this is
+    // strictly better than catching them downstream. IMPORTANT: Keepa's
+    // schema defines this field as a single Integer, NOT an array — an
+    // earlier version of this fix sent `productType: [0]`, which Keepa
+    // silently ignored (parents kept flooding through exactly as before,
+    // confirmed live 2026-08-21 by a run still showing ~30/71 raw
+    // candidates as parents post-"fix"). Re-verified against the docs'
+    // schema (`"productType": Integer`) and its one full example query
+    // (plain integers throughout, no arrays) before writing `0` here.
+    // The runtime isParentAsin() check in dedupeAsinsByVariantFamily() /
+    // buildDealPayload() stays in place regardless, as defense in depth
+    // (and it's still the only guard at all for DISCOVERY_MODE=deals,
+    // which has no equivalent Product Finder-style field to filter this
+    // server-side).
+    productType: 0,
     ...(PRODUCT_FINDER_EXCLUDED_CATEGORIES.length > 0
       ? { categories_exclude: PRODUCT_FINDER_EXCLUDED_CATEGORIES }
       : {}),
