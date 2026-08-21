@@ -19,7 +19,8 @@
  * "selection" object as a query param — confirmed against Keepa's own docs
  * (https://keepa.com/api-docs/deals.html), including the response shape
  * (deals.dr is the array). Tunable via env vars without touching code:
- * MIN_DEAL_DISCOUNT_PERCENT (default 20), DEAL_DISCOVERY_LIMIT (default 20,
+ * MIN_DEAL_DISCOUNT_PERCENT (default 40 — this site's actual bar for what
+ * counts as "a deal"), DEAL_DISCOVERY_LIMIT (default 20,
  * caps how many candidates get run through the full per-ASIN pipeline in
  * one call), MIN_DEAL_RATING_STARS (default 3.5), and DEAL_BRAND_ALLOWLIST
  * (comma-separated brand names — see DEFAULT_DEAL_BRAND_ALLOWLIST for the
@@ -209,7 +210,10 @@ const KEEPA_SORT_TYPE = {
 // Tunable without touching code — how big a discount counts as "a deal",
 // and how many discovered ASINs to actually process in one run (each one
 // costs a Keepa product lookup + a Creators API call + a LinkTwin call).
-const MIN_DEAL_DISCOUNT_PERCENT = Number(process.env.MIN_DEAL_DISCOUNT_PERCENT) || 20;
+// Bumped 20 -> 40 (2026-08-21): the site's actual goal, per the user, is
+// "40% OFF or more" — 20 was an early placeholder that never matched that.
+// Still fully overridable via MIN_DEAL_DISCOUNT_PERCENT without a code edit.
+const MIN_DEAL_DISCOUNT_PERCENT = Number(process.env.MIN_DEAL_DISCOUNT_PERCENT) || 40;
 const DEAL_DISCOVERY_LIMIT = Number(process.env.DEAL_DISCOVERY_LIMIT) || 20;
 
 // How many RAW candidates to pull from Keepa before variant-dedup/parent-
@@ -348,10 +352,20 @@ async function discoverDealAsins() {
 // these. Override via PRODUCT_FINDER_EXCLUDED_CATEGORY_IDS (comma-separated)
 // in .env.local — defaults to the user-confirmed real IDs for: Alexa Skills,
 // Amazon Appstore, Audible Books & Originals, Books, Kindle Store, Movies &
-// TV, Music, Prime Video, Software.
+// TV, Music, Prime Video, Software, and (added 2026-08-21) Clothing, Shoes &
+// Accessories (21204935011) — cross-referenced against multiple live
+// amazon.ca search-result URLs (n:21204935011 appears consistently across
+// many searches filtered by brand/size/style under that department, not
+// just one page), same verify-before-trusting standard as the other IDs
+// here. Clothing was added because apparel variation families are enormous
+// by nature (a shirt in every size x every colour is easily 100-1200+
+// variations — confirmed live: families with 727, 905, 979, and 1204
+// variations all showed up in one finder-mode run, eating most of
+// MAX_VARIANTS_TO_CHECK_PER_FAMILY on a department this site was never
+// trying to feature to begin with).
 const PRODUCT_FINDER_EXCLUDED_CATEGORIES = (
   process.env.PRODUCT_FINDER_EXCLUDED_CATEGORY_IDS ||
-  "16286269011,6386371011,20037537011,916520,2972705011,917972,916514,18730296011,3198021"
+  "16286269011,6386371011,20037537011,916520,2972705011,917972,916514,18730296011,3198021,21204935011"
 )
   .split(",")
   .map((id) => Number(id.trim()))
