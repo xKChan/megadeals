@@ -11,6 +11,7 @@ import {
   Share2,
   Bookmark,
   Check,
+  ShieldCheck,
 } from "lucide-react";
 
 /**
@@ -49,16 +50,19 @@ const RELATIVE_TIME_UNITS = [
   { unit: "minute", ms: 1000 * 60 },
 ];
 
-// Turns a created_at timestamp into "Added 2 hours ago" style text.
-function formatAddedAt(createdAt) {
-  if (!createdAt) return null;
-  const createdMs = new Date(createdAt).getTime();
-  if (Number.isNaN(createdMs)) return null;
+// Turns any ISO timestamp into "2 hours ago" style text. Shared by
+// created_at ("Added X ago") and last_verified_at ("Price verified X ago") —
+// two different fields with two different meanings (first published vs.
+// most recently confirmed-accurate), so callers supply their own label.
+function formatRelativeTime(timestamp) {
+  if (!timestamp) return null;
+  const ms = new Date(timestamp).getTime();
+  if (Number.isNaN(ms)) return null;
 
-  const diffMs = createdMs - Date.now();
-  for (const { unit, ms } of RELATIVE_TIME_UNITS) {
-    if (Math.abs(diffMs) >= ms) {
-      return RELATIVE_TIME_FORMATTER.format(Math.round(diffMs / ms), unit);
+  const diffMs = ms - Date.now();
+  for (const { unit, ms: unitMs } of RELATIVE_TIME_UNITS) {
+    if (Math.abs(diffMs) >= unitMs) {
+      return RELATIVE_TIME_FORMATTER.format(Math.round(diffMs / unitMs), unit);
     }
   }
   return "just now";
@@ -133,6 +137,7 @@ export default function DealCard({ deal }) {
     promo_text: promoText,
     promo_code: promoCode,
     created_at: createdAt,
+    last_verified_at: lastVerifiedAt,
     rating,
     review_count: reviewCount,
   } = deal;
@@ -168,7 +173,8 @@ export default function DealCard({ deal }) {
     }
   }
 
-  const addedAt = formatAddedAt(createdAt);
+  const addedAt = formatRelativeTime(createdAt);
+  const verifiedAt = formatRelativeTime(lastVerifiedAt);
   const PromoIcon = pickPromoIcon(promoText);
   const blurb = buildBlurb({ brand, title });
 
@@ -287,6 +293,17 @@ export default function DealCard({ deal }) {
             </span>
           )}
         </div>
+
+        {/* Amazon Associates compliance: the price above must be shown as
+            verified, not implied live. Deliberately its own visible pill
+            right under the price — not folded into the muted "Added" line —
+            so it can't be missed or mistaken for a marketing badge. */}
+        {verifiedAt && (
+          <div className="inline-flex w-fit items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700">
+            <ShieldCheck className="h-3.5 w-3.5" />
+            Price verified {verifiedAt}
+          </div>
+        )}
 
         {blurb && <p className="line-clamp-2 text-xs leading-snug text-gray-500">{blurb}</p>}
 
