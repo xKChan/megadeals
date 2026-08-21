@@ -181,6 +181,20 @@ const KEEPA_SORT_TYPE = {
 const MIN_DEAL_DISCOUNT_PERCENT = Number(process.env.MIN_DEAL_DISCOUNT_PERCENT) || 20;
 const DEAL_DISCOVERY_LIMIT = Number(process.env.DEAL_DISCOVERY_LIMIT) || 20;
 
+// How many RAW candidates to pull from Keepa before variant-dedup/parent-
+// ASIN filtering, as opposed to DEAL_DISCOVERY_LIMIT (the final count that
+// actually gets the costly Creators API + LinkTwin treatment). These used
+// to be the same cap, which meant a parent-ASIN-heavy raw feed could starve
+// a run down to almost nothing — confirmed live 2026-08-21: 17 of 20 raw
+// candidates were parent ASINs (one had 727 variations), leaving only 3
+// real products, one of which then got excluded as a DVD. Pulling a wider
+// raw pool up front and filtering BEFORE the final slice fixes that.
+// Tunable — a bigger multiplier means more Keepa /product token spend per
+// run (dedupeAsinsByVariantFamily fetches every raw candidate to check
+// isParentAsin), so dial it back if Keepa's rate limits start complaining.
+const DEAL_DISCOVERY_RAW_POOL =
+  Number(process.env.DEAL_DISCOVERY_RAW_POOL) || DEAL_DISCOVERY_LIMIT * 4;
+
 // Minimum product star rating (0-5). Keepa's own `minRating` selection field
 // uses a 0-50 integer scale (45 = 4.5 stars, confirmed against Keepa's docs
 // at https://keepa.com/api-docs/deals.html), so this converts once here.
@@ -256,7 +270,7 @@ async function discoverDealAsins() {
     return deals
       .map((deal) => deal.asin)
       .filter(Boolean)
-      .slice(0, DEAL_DISCOVERY_LIMIT);
+      .slice(0, DEAL_DISCOVERY_RAW_POOL);
   } catch (err) {
     console.warn(
       `  ! Keepa Deals API request failed: ` +
@@ -332,7 +346,7 @@ async function discoverDealAsinsViaProductFinder() {
     hasReviews: true,
     ...(DEAL_BRAND_ALLOWLIST.length > 0 ? { brand: DEAL_BRAND_ALLOWLIST } : {}),
     page: 0,
-    perPage: Math.max(DEAL_DISCOVERY_LIMIT, 50),
+    perPage: Math.max(DEAL_DISCOVERY_RAW_POOL, 50),
     // categories_exclude above covers digital/media categories (books, movies,
     // music, etc. — see PRODUCT_FINDER_EXCLUDED_CATEGORIES). It doesn't cover
     // DVDs specifically (Movies & TV is a media category but Amazon files
@@ -360,7 +374,7 @@ async function discoverDealAsinsViaProductFinder() {
     console.log(
       `  Product Finder matched ${data.totalResults ?? asinList.length} total product(s) before capping.`
     );
-    return asinList.slice(0, DEAL_DISCOVERY_LIMIT);
+    return asinList.slice(0, DEAL_DISCOVERY_RAW_POOL);
   } catch (err) {
     console.warn(
       `  ! Keepa Product Finder request failed: ` +
@@ -1004,6 +1018,14 @@ async function buildDealPayload(asin, prefetchedProduct = null) {
     promo_text: promoText,
     promo_code: promoCode,
     is_active: true,
+    // Amazon Associates compliance: displayed prices must be accurate or
+    // clearly disclaimed. This is the moment the Creators API cross-check
+    // above actually confirmed the price/availability directly against
+    // Amazon — set fresh on every successful sync (not just first publish),
+    // so the frontend can show a real "price verified X ago" badge instead
+    // of implying every displayed price is live. Requires a `last_verified_at`
+    // timestamptz column on `deals` — see the migration note in ROADMAP.md.
+    last_verified_at: new Date().toISOString(),
   };
 }
 
@@ -1070,11 +1092,17 @@ async function main() {
     `  ${deduped.length} unique product(s) after variant grouping (was ${asins.length} candidate(s)).`
   );
 
+  // Re-apply the real cost cap here, AFTER filtering — DEAL_DISCOVERY_RAW_POOL
+  // above intentionally over-fetches raw candidates so a parent-ASIN-heavy
+  // feed doesn't starve a run; this is what keeps the costly per-ASIN stage
+  // (Creators API + LinkTwin) bounded at DEAL_DISCOVERY_LIMIT regardless.
+  const toSync = deduped.slice(0, DEAL_DISCOVERY_LIMIT);
+
   console.log(
-    `Syncing ${deduped.length} ASIN(s) (Keepa + Amazon Creators API cross-check)...`
+    `Syncing ${toSync.length} ASIN(s) (Keepa + Amazon Creators API cross-check)...`
   );
 
-  for (const { asin, product } of deduped) {
+  for (const { asin, product } of toSync) {
     await syncDeal(asin, product);
     await sleep(1200); // be polite to Keepa's rate limits between calls
   }
