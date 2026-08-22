@@ -594,6 +594,38 @@ async function fetchKeepaProduct(asin, { full = true } = {}) {
   return product;
 }
 
+// Added 2026-08-22: wraps fetchKeepaProduct() with one retry on a 429
+// ("Too Many Requests" — this account is out of tokens or over Keepa's
+// rate limit right now, not a bad ASIN or a network blip). A transient
+// 429 can clear itself in a few seconds; a sustained one (e.g. the token
+// bucket is genuinely empty, or two runs are hitting the same API key at
+// once) won't, so after one cooldown+retry this throws with
+// `isKeepaRateLimit: true` set on the error rather than retrying forever —
+// callers (dedupeAsinsByVariantFamily()'s Pass 1/Pass 3 loops) use that
+// flag to stop checking further candidates for the rest of this run
+// instead of burning through the remaining pool as guaranteed-fail 429s.
+const KEEPA_RATE_LIMIT_COOLDOWN_MS = Number(process.env.KEEPA_RATE_LIMIT_COOLDOWN_MS) || 15000;
+
+async function fetchKeepaProductWithRateLimitRetry(asin, options) {
+  try {
+    return await fetchKeepaProduct(asin, options);
+  } catch (err) {
+    if (err.response?.status !== 429) throw err;
+    console.warn(
+      `  ! Keepa returned 429 for ${asin} — waiting ${KEEPA_RATE_LIMIT_COOLDOWN_MS / 1000}s and retrying once...`
+    );
+    await sleep(KEEPA_RATE_LIMIT_COOLDOWN_MS);
+    try {
+      return await fetchKeepaProduct(asin, options);
+    } catch (retryErr) {
+      if (retryErr.response?.status === 429) {
+        retryErr.isKeepaRateLimit = true;
+      }
+      throw retryErr;
+    }
+  }
+}
+
 // ── Price helpers ───────────────────────────────────────────────────────────
 // Keepa prices are in cents; -1 means "no data" and must be ignored.
 
@@ -1044,9 +1076,27 @@ async function dedupeAsinsByVariantFamily(asins) {
     if (seenAsins.has(asin)) continue;
     seenAsins.add(asin);
     try {
-      const cheapProduct = await fetchKeepaProduct(asin, { full: false });
+      const cheapProduct = await fetchKeepaProductWithRateLimitRetry(asin, { full: false });
       cheapChecked.push({ asin, cheapProduct });
     } catch (err) {
+      if (err.isKeepaRateLimit) {
+        // Added 2026-08-22: a 429 here means Keepa itself is rejecting
+        // every request for this account right now (out of tokens, or too
+        // many requests too fast) — continuing to loop through the
+        // remaining candidates would just burn through all of them as
+        // guaranteed-fail 429s (seen live: ~380 consecutive 429 lines in
+        // one run, wasting the whole job). Stop checking new candidates
+        // for the rest of THIS run instead — whatever's already in
+        // cheapChecked still gets processed, and the next scheduled run
+        // (or a manual retry once Keepa's limit window resets) picks up
+        // where this left off.
+        console.warn(
+          `  ! Keepa is rate-limiting this API key (429) — stopping new candidate ` +
+            `checks for this run after ${cheapChecked.length}/${asins.length}. Check ` +
+            `your Keepa account's token balance/rate limit before the next run.`
+        );
+        break;
+      }
       console.warn(
         `  ! Couldn't fetch Keepa product for ${asin} during variant dedup: ${err.message}`
       );
@@ -1140,7 +1190,7 @@ async function dedupeAsinsByVariantFamily(asins) {
   for (const entry of toCheckFull) {
     try {
       await sleep(1200); // rate-limit pause before each full fetch
-      const product = await fetchKeepaProduct(entry.asin, { full: true });
+      const product = await fetchKeepaProductWithRateLimitRetry(entry.asin, { full: true });
       if (isParentAsin(product)) {
         // Genuinely rare now that isParentAsin() checks parentAsin rather
         // than just variations.length (see the 2026-08-22 correction on
@@ -1154,6 +1204,16 @@ async function dedupeAsinsByVariantFamily(asins) {
       }
       results.push({ ...entry, product });
     } catch (err) {
+      if (err.isKeepaRateLimit) {
+        // Same reasoning as Pass 1's rate-limit guard above — stop paying
+        // for more full fetches this run rather than burning through the
+        // rest of toCheckFull as guaranteed 429s.
+        console.warn(
+          `  ! Keepa is rate-limiting this API key (429) — stopping full-fetch checks ` +
+            `for this run after ${results.length}/${toCheckFull.length}.`
+        );
+        break;
+      }
       console.warn(`  ! Couldn't fetch Keepa product for ${entry.asin}: ${err.message}`);
     }
   }
