@@ -23,7 +23,8 @@
  * counts as "a deal"), DEAL_DISCOVERY_LIMIT (default 20,
  * caps how many candidates get run through the full per-ASIN pipeline in
  * one call), MIN_DEAL_RATING_STARS (default 3.5), and DEAL_BRAND_ALLOWLIST
- * (comma-separated brand names — see DEFAULT_DEAL_BRAND_ALLOWLIST for the
+ * (comma-separated brand names, empty/off by default as of 2026-08-22 —
+ * see DEFAULT_DEAL_BRAND_ALLOWLIST for the
  * starter list). Books/DVDs are excluded and FBA is verified downstream in
  * buildDealPayload() from real per-offer Keepa data, not at discovery time
  * — see getExcludedCategoryLabel() / hasLiveFbaNewOffer() below for why.
@@ -248,18 +249,40 @@ const MAX_VARIANTS_TO_CHECK_PER_FAMILY =
 const MIN_DEAL_RATING_STARS = Number(process.env.MIN_DEAL_RATING_STARS) || 3.5;
 const MIN_DEAL_RATING_KEEPA_SCALE = Math.round(MIN_DEAL_RATING_STARS * 10);
 
-// "Popular brand" allowlist — a starter list of well-known consumer brands,
-// editable anytime in .env.local (comma-separated) without touching code.
-// Keepa's `brand` selection field ("Include only products from the
-// specified brand", array of strings, per Keepa's docs) filters discovery
-// results server-side, before any product/Creators-API/LinkTwin call is
-// spent on a candidate. Brand matching against Keepa's tracked brand string
-// hasn't been confirmed against a live run yet — if a brand you expect to
-// see never turns up, it may need exact-casing/spelling to match what
-// Keepa/Amazon has on file for that ASIN.
-const DEFAULT_DEAL_BRAND_ALLOWLIST =
-  "Sony,Samsung,Apple,Anker,Bose,JBL,Logitech,LEGO,Philips,Panasonic,Dyson,KitchenAid,Instant Pot,Ninja,Shark,Keurig,Black+Decker,Cuisinart,Hasbro,Mattel,Nike,Adidas,Under Armour,Crocs,Levi's,Nintendo,Microsoft,Google,Fitbit,Garmin,Bissell,Braun,Oral-B,Gillette,L'Oréal,Nivea";
-const DEAL_BRAND_ALLOWLIST = (process.env.DEAL_BRAND_ALLOWLIST || DEFAULT_DEAL_BRAND_ALLOWLIST)
+// "Popular brand" allowlist — OFF by default (removed 2026-08-22, user
+// request: the ~35-brand starter list below, combined with the discount/
+// rating/review-count/sales-rank filters, was narrowing the already-small
+// Product Finder candidate pool too far — e.g. one run matched only 12
+// total products across all of Amazon.ca once MIN_DEAL_REVIEW_COUNT was
+// also raised to 500). Set DEAL_BRAND_ALLOWLIST (comma-separated, in
+// .env.local or as a repo Variable) any time you want to bring brand
+// restriction back — no code change needed either way. Keepa's `brand`
+// selection field ("Include only products from the specified brand", array
+// of strings, per Keepa's docs) filters discovery results server-side,
+// before any product/Creators-API/LinkTwin call is spent on a candidate.
+// Brand matching against Keepa's tracked brand string hasn't been confirmed
+// against a live run yet — if a brand you expect to see never turns up, it
+// may need exact-casing/spelling to match what Keepa/Amazon has on file for
+// that ASIN.
+const DEFAULT_DEAL_BRAND_ALLOWLIST = "";
+// Sample starter list, kept here for reference / easy copy-paste back into
+// DEFAULT_DEAL_BRAND_ALLOWLIST above (or DEAL_BRAND_ALLOWLIST in .env.local)
+// if brand restriction is ever wanted again:
+// "Sony,Samsung,Apple,Anker,Bose,JBL,Logitech,LEGO,Philips,Panasonic,Dyson,
+//  KitchenAid,Instant Pot,Ninja,Shark,Keurig,Black+Decker,Cuisinart,Hasbro,
+//  Mattel,Nike,Adidas,Under Armour,Crocs,Levi's,Nintendo,Microsoft,Google,
+//  Fitbit,Garmin,Bissell,Braun,Oral-B,Gillette,L'Oréal,Nivea"
+//
+// Uses `!== undefined` rather than `||` so an explicitly-empty override (a
+// repo Variable set to "") is respected as "no brands" rather than falling
+// back to the default — `"" || DEFAULT` would silently re-apply whatever
+// DEFAULT_DEAL_BRAND_ALLOWLIST is, which isn't what "I set it to nothing"
+// should mean.
+const DEAL_BRAND_ALLOWLIST = (
+  process.env.DEAL_BRAND_ALLOWLIST !== undefined
+    ? process.env.DEAL_BRAND_ALLOWLIST
+    : DEFAULT_DEAL_BRAND_ALLOWLIST
+)
   .split(",")
   .map((b) => b.trim())
   .filter(Boolean);
