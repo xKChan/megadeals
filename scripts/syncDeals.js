@@ -187,6 +187,20 @@ const KEEPA_PRODUCT_URL = "https://api.keepa.com/product";
 const KEEPA_DEAL_URL = "https://api.keepa.com/deal";
 const KEEPA_QUERY_URL = "https://api.keepa.com/query"; // Product Finder
 
+// Added 2026-08-22: none of this file's axios calls had a `timeout` set,
+// which means axios' default applies — no timeout at all. Fine for a
+// handful of candidates, but a real problem once discovery routinely
+// returns hundreds (opening up the brand allowlist took one run from 12
+// candidates to 413) — dedupeAsinsByVariantFamily() fetches each candidate
+// one at a time in a sequential loop, so a single Keepa request that hangs
+// (rather than erroring) blocks every candidate behind it and can stall an
+// entire run past the workflow's 20-minute job timeout, publishing nothing
+// even though hundreds of real candidates were sitting there. Every Keepa/
+// LinkTwin axios call below now passes this timeout; the existing per-ASIN
+// try/catch around each call site turns a timed-out request into a logged
+// warning and a move to the next candidate, instead of a silent full stall.
+const KEEPA_REQUEST_TIMEOUT_MS = Number(process.env.KEEPA_REQUEST_TIMEOUT_MS) || 20000;
+
 // Keepa csv/stats.current array indices relevant to this script.
 // (Full reference: https://keepa.com/#!discuss/t/product-object/116)
 const CSV_TYPE = {
@@ -326,6 +340,7 @@ async function discoverDealAsins() {
   try {
     const { data } = await axios.get(KEEPA_DEAL_URL, {
       params: { key: KEEPA_API_KEY, selection: JSON.stringify(selection) },
+      timeout: KEEPA_REQUEST_TIMEOUT_MS,
     });
 
     const deals = data?.deals?.dr;
@@ -472,6 +487,7 @@ async function discoverDealAsinsViaProductFinder() {
   try {
     const { data } = await axios.get(KEEPA_QUERY_URL, {
       params: { key: KEEPA_API_KEY, domain: KEEPA_DOMAIN_CA, selection: JSON.stringify(selection) },
+      timeout: KEEPA_REQUEST_TIMEOUT_MS,
     });
 
     const asinList = data?.asinList;
@@ -568,6 +584,7 @@ async function fetchKeepaProduct(asin, { full = true } = {}) {
           }
         : {}),
     },
+    timeout: KEEPA_REQUEST_TIMEOUT_MS,
   });
 
   const product = data?.products?.[0];
@@ -856,7 +873,10 @@ async function generateDeepLink(rawUrl) {
   const response = await axios.post(
     "https://linktw.in/api/url/add",
     { url: rawUrl },
-    { headers: { Authorization: `Bearer ${LINKTWIN_API_KEY}` } }
+    {
+      headers: { Authorization: `Bearer ${LINKTWIN_API_KEY}` },
+      timeout: KEEPA_REQUEST_TIMEOUT_MS,
+    }
   );
 
   const shortUrl = response.data?.shorturl;
