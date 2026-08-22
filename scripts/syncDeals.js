@@ -959,18 +959,32 @@ async function fetchAmazonListing(asin) {
 // until re-synced or manually cleaned up — same caveat as the two pre-fix
 // junk rows noted in ROADMAP.md.
 //
-// A parent/family ASIN itself (Keepa's `variations` array is only ever
-// populated on parent ASINs — confirmed against the same api_backend source
-// as parentAsin above) has no single buyable price and no single Amazon
-// listing of its own — its /dp/ page is the "choose your options" page with
-// a price RANGE, exactly what showed up when a deal link didn't land on a
-// specific size (found 2026-08-21: a real deal's rawUrl resolved to a
-// parent ASIN via Keepa discovery, which is why the affiliate link didn't
-// preselect anything). The parent record itself must never be published as
-// a deal — but per the above, its family is now expanded into real children
-// rather than the whole family being discarded.
+// A parent/family ASIN itself has no single buyable price and no single
+// Amazon listing of its own — its /dp/ page is the "choose your options"
+// page with a price RANGE, exactly what showed up when a deal link didn't
+// land on a specific size (found 2026-08-21: a real deal's rawUrl resolved
+// to a parent ASIN via Keepa discovery, which is why the affiliate link
+// didn't preselect anything). The parent record itself must never be
+// published as a deal — but per the above, its family is now expanded into
+// real children rather than the whole family being discarded.
+//
+// CORRECTED 2026-08-22: originally this checked only `variations.length >
+// 0`, on the assumption (based on a reading of Keepa's api_backend source)
+// that Keepa only ever populates `variations` on the true top-of-tree
+// parent. A live run proved that wrong — Keepa attaches a `variations`
+// array to CHILD records too (every family member gets the same sibling
+// list, not just the parent). That false assumption made Pass 3 below
+// treat every single fetched child as "unexpectedly its own parent" and
+// throw it away, silently zeroing out every Finder-mode run. The real
+// signal for "is this record itself the top of the family tree" is
+// `parentAsin`: a true parent has none; every child, however many arrays
+// Keepa also hangs off its record, always points up via `parentAsin`.
 function isParentAsin(product) {
-  return Array.isArray(product.variations) && product.variations.length > 0;
+  return (
+    !product.parentAsin &&
+    Array.isArray(product.variations) &&
+    product.variations.length > 0
+  );
 }
 
 async function dedupeAsinsByVariantFamily(asins) {
@@ -1085,10 +1099,13 @@ async function dedupeAsinsByVariantFamily(asins) {
       await sleep(1200); // rate-limit pause before each full fetch
       const product = await fetchKeepaProduct(entry.asin, { full: true });
       if (isParentAsin(product)) {
-        // Shouldn't happen — Keepa's model has `variations` only ever
-        // populated on the parent, never on a child — but stay defensive.
+        // Genuinely rare now that isParentAsin() checks parentAsin rather
+        // than just variations.length (see the 2026-08-22 correction on
+        // that function) — this only fires for a real nested case, e.g. a
+        // second-level sub-family, where entry.asin turned out to be a
+        // parent in its own right rather than a directly-buyable child.
         console.warn(
-          `  ! ${entry.asin} unexpectedly has its own variations — skipping.`
+          `  ! ${entry.asin} is itself a parent ASIN (nested variation family) — skipping.`
         );
         continue;
       }
