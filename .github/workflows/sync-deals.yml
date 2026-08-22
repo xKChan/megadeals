@@ -2,31 +2,28 @@ name: Sync Deals
 
 # Runs scripts/syncDeals.js on a schedule so the site's Supabase `deals`
 # table stays fresh without anyone running it by hand. Reuses the exact
-# same Node script as local runs -- no separate pipeline to maintain.
+# same Node script as local runs — no separate pipeline to maintain.
 #
 # Requires these repo secrets (Settings -> Secrets and variables -> Actions
-# -> New repository secret) -- same names/values as your local .env.local:
+# -> New repository secret) — same names/values as your local .env.local:
 #   KEEPA_API_KEY, AMAZON_AFFILIATE_TAG, LINKTWIN_API_KEY, VITE_SUPABASE_URL,
 #   VITE_SUPABASE_SECRET_KEY, AMAZON_CREDENTIAL_ID, AMAZON_CREDENTIAL_SECRET,
 #   AMAZON_CREDENTIAL_VERSION, AMAZON_MARKETPLACE
 # Without these, syncDeals.js's own requireEnv() check fails fast with a
-# clear "Missing required env vars" list in the run log -- not a silent
+# clear "Missing required env vars" list in the run log — not a silent
 # no-op.
 #
-# All tuning knobs below (DISCOVERY_MODE, DEAL_DISCOVERY_LIMIT, etc.) have
-# safe defaults baked into the code, but are wired to repo VARIABLES (not
-# secrets) below -- Settings -> Secrets and variables -> Actions -> Variables
-# tab -> New repository variable. Add or edit one there and it takes effect
-# on the next run automatically, no code change or push needed. Only set the
-# ones you actually want to override; anything left unset in that tab just
-# falls back to the code default (an empty/unset var here is harmless).
+# All other env vars the script reads (DISCOVERY_MODE, DEAL_DISCOVERY_LIMIT,
+# MIN_DEAL_DISCOUNT_PERCENT, etc.) have safe defaults baked into the code —
+# only add them below as repo Variables if you want to override a default
+# without touching code.
 
 on:
   schedule:
-    - cron: "0 8 * * *" # once daily at 08:00 UTC -- GitHub may delay a run
-    # slightly under load; scheduled workflows also auto-disable after 60
-    # days with zero commits to the repo (a GitHub platform limit, not
-    # something this workflow controls) -- a push re-enables it.
+    - cron: "0 * * * *" # every hour, on the hour (UTC) — GitHub may delay a
+    # run slightly under load; scheduled workflows also auto-disable after
+    # 60 days with zero commits to the repo (a GitHub platform limit, not
+    # something this workflow controls) — a push re-enables it.
   workflow_dispatch: {} # adds a manual "Run workflow" button in the Actions tab
 
 jobs:
@@ -55,17 +52,21 @@ jobs:
           AMAZON_CREDENTIAL_SECRET: ${{ secrets.AMAZON_CREDENTIAL_SECRET }}
           AMAZON_CREDENTIAL_VERSION: ${{ secrets.AMAZON_CREDENTIAL_VERSION }}
           AMAZON_MARKETPLACE: ${{ secrets.AMAZON_MARKETPLACE }}
-          # Tuning knobs -- set as repo Variables (see header note above) to
-          # override a default without touching code. Uncommented/wired here
-          # once so every future change is just editing a value on GitHub.
+          # Optional tuning knobs (added 2026-08-21: previously listed here
+          # but commented out, which meant setting any of these as a repo
+          # Variable in the GitHub UI did NOTHING — the env line below has to
+          # actually reference ${{ vars.X }} for a Variable to reach the
+          # script at all. Now wired live. Each one is still safe to leave
+          # unset: every var below reads as "" when no repo Variable exists,
+          # and syncDeals.js treats an empty/unset value as "use the code
+          # default" (Number("") || fallback, "" || fallback, etc.) — so
+          # nothing here changes behavior until you actually set a Variable
+          # at Settings -> Secrets and variables -> Actions -> Variables tab.
           DISCOVERY_MODE: ${{ vars.DISCOVERY_MODE }}
           MIN_DEAL_DISCOUNT_PERCENT: ${{ vars.MIN_DEAL_DISCOUNT_PERCENT }}
           DEAL_DISCOVERY_LIMIT: ${{ vars.DEAL_DISCOVERY_LIMIT }}
-          DEAL_DISCOVERY_RAW_POOL: ${{ vars.DEAL_DISCOVERY_RAW_POOL }}
           MIN_DEAL_RATING_STARS: ${{ vars.MIN_DEAL_RATING_STARS }}
           DEAL_BRAND_ALLOWLIST: ${{ vars.DEAL_BRAND_ALLOWLIST }}
           MIN_DEAL_REVIEW_COUNT: ${{ vars.MIN_DEAL_REVIEW_COUNT }}
           PRODUCT_FINDER_MAX_SALES_RANK: ${{ vars.PRODUCT_FINDER_MAX_SALES_RANK }}
           PRODUCT_FINDER_EXCLUDED_CATEGORY_IDS: ${{ vars.PRODUCT_FINDER_EXCLUDED_CATEGORY_IDS }}
-          EXPIRE_REVERIFY_BATCH_SIZE: ${{ vars.EXPIRE_REVERIFY_BATCH_SIZE }}
-          EXPIRE_STALE_HOURS: ${{ vars.EXPIRE_STALE_HOURS }}
