@@ -29,7 +29,14 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Bumped 20 -> 35 (2026-08-22): dedupeAsinsByVariantFamily() fetches
+    # each candidate one at a time (a real Keepa rate-limit pause between
+    # each), so with the brand allowlist now off and MIN_DEAL_REVIEW_COUNT
+    # lowered, a run finding hundreds of raw candidates can genuinely need
+    # more than 20 minutes even with nothing going wrong. Pair this with
+    # DEAL_DISCOVERY_RAW_POOL below to keep a single run's candidate count
+    # (and therefore its wall-clock time) bounded and predictable.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
 
@@ -70,3 +77,12 @@ jobs:
           MIN_DEAL_REVIEW_COUNT: ${{ vars.MIN_DEAL_REVIEW_COUNT }}
           PRODUCT_FINDER_MAX_SALES_RANK: ${{ vars.PRODUCT_FINDER_MAX_SALES_RANK }}
           PRODUCT_FINDER_EXCLUDED_CATEGORY_IDS: ${{ vars.PRODUCT_FINDER_EXCLUDED_CATEGORY_IDS }}
+          # Added 2026-08-22: caps how many raw candidates get pulled into
+          # the per-ASIN check loop BEFORE it runs (as opposed to
+          # DEAL_DISCOVERY_LIMIT, which only trims the final list AFTER
+          # filtering). Defaults to DEAL_DISCOVERY_LIMIT * 4 if unset, which
+          # is how a 413-candidate run happened once the brand allowlist
+          # came off — each candidate costs a real Keepa call, so a big raw
+          # pool directly costs wall-clock time. Recommend starting at 100
+          # here and raising it once you've seen how long a real run takes.
+          DEAL_DISCOVERY_RAW_POOL: ${{ vars.DEAL_DISCOVERY_RAW_POOL }}
