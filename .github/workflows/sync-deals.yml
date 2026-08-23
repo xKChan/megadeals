@@ -20,7 +20,7 @@ name: Sync Deals
 
 on:
   schedule:
-    - cron: "0 * * * *" # every hour, on the hour (UTC) — GitHub may delay a
+    - cron: "0 0 * * *" # every hour, on the hour (UTC) — GitHub may delay a
     # run slightly under load; scheduled workflows also auto-disable after
     # 60 days with zero commits to the repo (a GitHub platform limit, not
     # something this workflow controls) — a push re-enables it.
