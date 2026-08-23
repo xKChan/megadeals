@@ -201,6 +201,35 @@ const KEEPA_QUERY_URL = "https://api.keepa.com/query"; // Product Finder
 // warning and a move to the next candidate, instead of a silent full stall.
 const KEEPA_REQUEST_TIMEOUT_MS = Number(process.env.KEEPA_REQUEST_TIMEOUT_MS) || 20000;
 
+// Added 2026-08-22: the flat 1200ms sleep between every Keepa call (below,
+// throughout this file) was calibrated for a plan with a much higher token
+// rate than this account actually has. Checked directly against the
+// account's own Keepa dashboard: 20 tokens/minute, 1200 token bucket cap.
+// Checked against Keepa's own docs (keepa.com/api-docs/): a /product call
+// costs 1 token per ASIN, plus 6 tokens per "offer page" of up to 10
+// offers when `offers` is requested — this script asks for `offers: 20`
+// (2 pages), so a full fetch (offers+stats) costs roughly 1 + 6*2 = 13
+// tokens; the cheap fetch (no offers/stats) costs the base 1 token. NOTE:
+// Keepa's docs don't spell out whether `stats` itself adds further cost on
+// top of that — 13 is treated as a floor, not a confirmed exact number,
+// which is why KEEPA_FULL_FETCH_TOKEN_COST below is deliberately
+// overridable and the values include a safety margin rather than pacing
+// to the exact minimum. A flat 1.2s pause implies a ~50 requests/minute
+// budget — at 1 token/request that's already over 2x this account's 20/min
+// rate, and at 13 tokens/request (every full fetch) it's roughly 30x over
+// budget, which is the real reason runs were hitting 429 almost
+// immediately rather than any bug in the retry/timeout logic itself.
+// keepaPaceDelayMs() paces each call to what the account can actually
+// sustain rather than an arbitrary fixed number, so a run trades speed for
+// not getting rate-limited, instead of both being slow AND rate-limited.
+const KEEPA_TOKENS_PER_MINUTE = Number(process.env.KEEPA_TOKENS_PER_MINUTE) || 20;
+const KEEPA_CHEAP_FETCH_TOKEN_COST = Number(process.env.KEEPA_CHEAP_FETCH_TOKEN_COST) || 1;
+const KEEPA_FULL_FETCH_TOKEN_COST = Number(process.env.KEEPA_FULL_FETCH_TOKEN_COST) || 13;
+
+function keepaPaceDelayMs(tokenCost) {
+  return Math.ceil((tokenCost / KEEPA_TOKENS_PER_MINUTE) * 60000);
+}
+
 // Keepa csv/stats.current array indices relevant to this script.
 // (Full reference: https://keepa.com/#!discuss/t/product-object/116)
 const CSV_TYPE = {
@@ -1101,7 +1130,7 @@ async function dedupeAsinsByVariantFamily(asins) {
         `  ! Couldn't fetch Keepa product for ${asin} during variant dedup: ${err.message}`
       );
     }
-    await sleep(1200);
+    await sleep(keepaPaceDelayMs(KEEPA_CHEAP_FETCH_TOKEN_COST));
   }
 
   // Pass 2: build the list of candidates that actually need a full
@@ -1161,7 +1190,7 @@ async function dedupeAsinsByVariantFamily(asins) {
     let labelByAsin = null;
     if (memberAsins.length > 1) {
       try {
-        await sleep(1200);
+        await sleep(keepaPaceDelayMs(KEEPA_CHEAP_FETCH_TOKEN_COST));
         const parentProduct = await fetchKeepaProduct(parentAsin, { full: false });
         if (Array.isArray(parentProduct.variations)) {
           labelByAsin = new Map(
@@ -1189,7 +1218,7 @@ async function dedupeAsinsByVariantFamily(asins) {
   const results = []; // [{asin, product, familyAsin, variantAttributes}, ...]
   for (const entry of toCheckFull) {
     try {
-      await sleep(1200); // rate-limit pause before each full fetch
+      await sleep(keepaPaceDelayMs(KEEPA_FULL_FETCH_TOKEN_COST)); // paced to the account's real token budget
       const product = await fetchKeepaProductWithRateLimitRetry(entry.asin, { full: true });
       if (isParentAsin(product)) {
         // Genuinely rare now that isParentAsin() checks parentAsin rather
@@ -1476,7 +1505,7 @@ async function refreshStaleActiveDeals() {
         console.warn(`  ! Also failed to deactivate ${asin}: ${deactivateError.message}`);
       }
     }
-    await sleep(1200);
+    await sleep(keepaPaceDelayMs(KEEPA_FULL_FETCH_TOKEN_COST)); // buildDealPayload() does a full fetch here too
   }
 }
 
