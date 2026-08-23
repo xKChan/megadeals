@@ -26,17 +26,34 @@ on:
     # something this workflow controls) — a push re-enables it.
   workflow_dispatch: {} # adds a manual "Run workflow" button in the Actions tab
 
+# Added 2026-08-22: now that syncDeals.js paces requests to the account's
+# real Keepa token budget (20/min on the current plan) rather than a fixed
+# 1.2s, a run with a sizeable raw pool can genuinely take longer than the
+# hourly cron interval. Without this, an hourly trigger firing while the
+# previous run is still going would mean two runs sharing the same 20
+# tokens/minute budget at once -- which is exactly the kind of thing that
+# caused the 429 storm this was built to prevent. `group` scopes this to
+# one in-flight run of this workflow at a time; cancel-in-progress is left
+# false (the safe default) so a legitimately still-running sync is queued
+# behind, never killed mid-way -- a run that's simply running long just
+# pushes the next trigger later instead of overlapping it.
+concurrency:
+  group: sync-deals
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-    # Bumped 20 -> 35 (2026-08-22): dedupeAsinsByVariantFamily() fetches
-    # each candidate one at a time (a real Keepa rate-limit pause between
-    # each), so with the brand allowlist now off and MIN_DEAL_REVIEW_COUNT
-    # lowered, a run finding hundreds of raw candidates can genuinely need
-    # more than 20 minutes even with nothing going wrong. Pair this with
-    # DEAL_DISCOVERY_RAW_POOL below to keep a single run's candidate count
-    # (and therefore its wall-clock time) bounded and predictable.
-    timeout-minutes: 35
+    # Bumped 20 -> 35 -> 90 (2026-08-22): dedupeAsinsByVariantFamily() now
+    # paces each request to this account's real Keepa budget (20 tokens/
+    # min, confirmed on the account's own dashboard) rather than a fixed
+    # 1.2s -- a full-fetch candidate (offers+stats, ~13 tokens) now takes
+    # ~39s to stay within budget, not 1.2s. A raw pool sized to roughly
+    # match one hour's worth of tokens (see DEAL_DISCOVERY_RAW_POOL below)
+    # can still take most of an hour to fully process. 90 minutes gives
+    # real headroom; the concurrency guard above means a long run just
+    # delays the next trigger rather than causing an overlap.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -77,12 +94,18 @@ jobs:
           MIN_DEAL_REVIEW_COUNT: ${{ vars.MIN_DEAL_REVIEW_COUNT }}
           PRODUCT_FINDER_MAX_SALES_RANK: ${{ vars.PRODUCT_FINDER_MAX_SALES_RANK }}
           PRODUCT_FINDER_EXCLUDED_CATEGORY_IDS: ${{ vars.PRODUCT_FINDER_EXCLUDED_CATEGORY_IDS }}
-          # Added 2026-08-22: caps how many raw candidates get pulled into
-          # the per-ASIN check loop BEFORE it runs (as opposed to
-          # DEAL_DISCOVERY_LIMIT, which only trims the final list AFTER
-          # filtering). Defaults to DEAL_DISCOVERY_LIMIT * 4 if unset, which
-          # is how a 413-candidate run happened once the brand allowlist
-          # came off — each candidate costs a real Keepa call, so a big raw
-          # pool directly costs wall-clock time. Recommend starting at 100
-          # here and raising it once you've seen how long a real run takes.
+          # Added 2026-08-22, recalculated same day once the account's real
+          # Keepa budget was confirmed (20 tokens/min, 1200 token cap): caps
+          # how many raw candidates get pulled into the per-ASIN check loop
+          # BEFORE it runs (as opposed to DEAL_DISCOVERY_LIMIT, which only
+          # trims the final list AFTER filtering). Defaults to
+          # DEAL_DISCOVERY_LIMIT * 4 if unset. Recommend setting this to
+          # around 150: cheap-checking 150 candidates costs ~150 tokens: if
+          # roughly half turn out to need a full fetch (13 tokens each),
+          # that's another ~975 -- close to the ~1200 tokens this account
+          # earns per hour, so one run's real Keepa cost roughly matches
+          # what it earns back before the next one. Push this higher only
+          # after upgrading the Keepa plan's token rate (see PLAN & USAGE
+          # in Keepa's dashboard) -- raising it without more tokens/minute
+          # just means a longer queue of 429s once the bucket runs dry.
           DEAL_DISCOVERY_RAW_POOL: ${{ vars.DEAL_DISCOVERY_RAW_POOL }}

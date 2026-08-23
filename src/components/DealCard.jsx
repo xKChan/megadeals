@@ -99,29 +99,22 @@ function buildBlurb({ brand, title }) {
 
 // variant_attributes is a jsonb column. Confirmed 2026-08-21 by the backend
 // chat: it's an ARRAY of {dimension, value} pairs matching Keepa's own
-// format — e.g. [{"dimension":"Size","value":"4"},{"dimension":"Colour","value":"Black"}]
-// — NOT a plain {key: value} object. (An earlier version of this function
-// explicitly skipped arrays and always fell through to "Option N" for real
-// data — silently wrong, not a crash, but wrong. Fixed here.) Still falls
-// back to a generic "Option N" label if the data is missing/empty/some
-// other shape, so a variant with no variant_attributes still gets a
-// clickable chip instead of disappearing.
+// format — e.g. [{"dimension":"Size","value":"4"},{"dimension":"Colour","value":"Black"}].
+// (An earlier version of this function explicitly skipped arrays and always
+// fell through to "Option N" for real data — silently wrong, not a crash,
+// but wrong. Fixed, then simplified once the array shape was confirmed as
+// the only real shape — no more speculative plain-object branch.) Falls
+// back to a generic "Option N" label if the data is missing/empty, so a
+// variant with no variant_attributes still gets a clickable chip instead
+// of disappearing.
 function getVariantLabel(variant, index) {
   const attrs = variant.variant_attributes;
-
-  if (Array.isArray(attrs)) {
+  if (Array.isArray(attrs) && attrs.length > 0) {
     const values = attrs
-      .map((entry) => (entry && typeof entry === "object" ? entry.value : null))
+      .map((entry) => entry?.value)
       .filter((value) => value !== null && value !== undefined && value !== "");
     if (values.length > 0) return values.join(" / ");
-  } else if (attrs && typeof attrs === "object") {
-    // Defensive fallback in case the shape ever changes to a plain object.
-    const values = Object.values(attrs).filter(
-      (value) => value !== null && value !== undefined && value !== ""
-    );
-    if (values.length > 0) return values.join(" / ");
   }
-
   return `Option ${index + 1}`;
 }
 
