@@ -286,6 +286,23 @@ const DEAL_DISCOVERY_RAW_POOL =
 const MAX_VARIANTS_TO_CHECK_PER_FAMILY =
   Number(process.env.MAX_VARIANTS_TO_CHECK_PER_FAMILY) || 25;
 
+// Added 2026-08-23: DEAL_DISCOVERY_RAW_POOL bounds how many RAW candidates
+// Pass 1 looks at, but not how much work Pass 3 ends up doing — each of
+// those raw candidates that turns out to be a real parent can fan out into
+// up to MAX_VARIANTS_TO_CHECK_PER_FAMILY children above, so a raw pool of
+// 150 mostly-parent candidates can still produce hundreds of Pass 3 full-
+// fetch checks. Confirmed live: RAW_POOL=150 still got cancelled by the
+// job's own 90-minute timeout, stuck partway through Pass 3, because the
+// full-fetch pacing (~39s/candidate on this account's 20 tokens/min
+// budget) times a fan-out that size comfortably exceeds an hour. This caps
+// Pass 3's total item count directly, which is what actually determines a
+// run's wall-clock time, regardless of how parent-heavy the raw pool turns
+// out to be. Sized so MAX_FULL_FETCH_CHECKS_PER_RUN candidates at the full-
+// fetch pace stay well inside the job timeout with room to spare for Pass 1
+// and the sync stage after it.
+const MAX_FULL_FETCH_CHECKS_PER_RUN =
+  Number(process.env.MAX_FULL_FETCH_CHECKS_PER_RUN) || 100;
+
 // Minimum product star rating (0-5). Keepa's own `minRating` selection field
 // uses a 0-50 integer scale (45 = 4.5 stars, confirmed against Keepa's docs
 // at https://keepa.com/api-docs/deals.html), so this converts once here.
@@ -1214,9 +1231,19 @@ async function dedupeAsinsByVariantFamily(asins) {
 
   // Pass 3: the full (offers+stats) fetch — the actual data used for price/
   // discount and the eventual deal payload — for every survivor, expanded
-  // children and bare/standalone candidates alike.
+  // children and bare/standalone candidates alike. Capped at
+  // MAX_FULL_FETCH_CHECKS_PER_RUN (see that constant's doc comment) so a
+  // parent-heavy raw pool can't blow the job's time budget — no silent
+  // truncation, the drop is logged so it's visible in the run output.
+  const fullFetchQueue = toCheckFull.slice(0, MAX_FULL_FETCH_CHECKS_PER_RUN);
+  if (toCheckFull.length > fullFetchQueue.length) {
+    console.log(
+      `  Capping full-price checks at MAX_FULL_FETCH_CHECKS_PER_RUN=${MAX_FULL_FETCH_CHECKS_PER_RUN} ` +
+        `(${toCheckFull.length - fullFetchQueue.length} candidate(s) deferred to a future run).`
+    );
+  }
   const results = []; // [{asin, product, familyAsin, variantAttributes}, ...]
-  for (const entry of toCheckFull) {
+  for (const entry of fullFetchQueue) {
     try {
       await sleep(keepaPaceDelayMs(KEEPA_FULL_FETCH_TOKEN_COST)); // paced to the account's real token budget
       const product = await fetchKeepaProductWithRateLimitRetry(entry.asin, { full: true });
@@ -1239,7 +1266,7 @@ async function dedupeAsinsByVariantFamily(asins) {
         // rest of toCheckFull as guaranteed 429s.
         console.warn(
           `  ! Keepa is rate-limiting this API key (429) — stopping full-fetch checks ` +
-            `for this run after ${results.length}/${toCheckFull.length}.`
+            `for this run after ${results.length}/${fullFetchQueue.length}.`
         );
         break;
       }
