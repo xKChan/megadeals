@@ -297,11 +297,30 @@ const MAX_VARIANTS_TO_CHECK_PER_FAMILY =
 // budget) times a fan-out that size comfortably exceeds an hour. This caps
 // Pass 3's total item count directly, which is what actually determines a
 // run's wall-clock time, regardless of how parent-heavy the raw pool turns
-// out to be. Sized so MAX_FULL_FETCH_CHECKS_PER_RUN candidates at the full-
-// fetch pace stay well inside the job timeout with room to spare for Pass 1
-// and the sync stage after it.
+// out to be.
+//
+// Revised 2026-08-24: the first value here (100) was sized on Pass 3's own
+// pace math alone (100 * 39s = 65min) and assumed that left "room to spare"
+// for everything else — it didn't. Confirmed live with RAW_POOL lowered to
+// 120: the run STILL got cancelled at the full 90-minute mark, silent the
+// entire time after "Checking N candidates" (Pass 3 has no per-item log on
+// success, only on error — fixed below by adding one). Full accounting of
+// what shares the same 90-minute ceiling as Pass 3:
+//   Pass 1 (cheap, ~3s/candidate)         ~RAW_POOL * 3s
+//   Pass 2b (cheap, per shared parent)    usually small, but not zero
+//   Pass 3 (full, ~39s/candidate)         MAX_FULL_FETCH_CHECKS_PER_RUN * 39s
+//   refreshStaleActiveDeals() (full)      EXPIRE_REVERIFY_BATCH_SIZE * 39s
+//   LinkTwin + Supabase per published deal  ~1.2s each, usually minor
+// At 100, Pass 3 alone (65min) plus the rest left almost no slack — normal
+// per-request latency on top of the paced delay was enough to tip it over.
+// Dropped to 60 (60 * 39s = 39min) so the full run — Pass 1 + Pass 2b +
+// Pass 3 + the refresh pass + publishing — has real headroom under 90min
+// instead of running right up against the wall every time. Raise this again
+// only alongside either a higher job timeout-minutes or a bigger Keepa
+// token/minute plan (see PLAN & USAGE in Keepa's dashboard) — not in
+// isolation, since Pass 3's pace is fixed by the account's real token rate.
 const MAX_FULL_FETCH_CHECKS_PER_RUN =
-  Number(process.env.MAX_FULL_FETCH_CHECKS_PER_RUN) || 100;
+  Number(process.env.MAX_FULL_FETCH_CHECKS_PER_RUN) || 60;
 
 // Minimum product star rating (0-5). Keepa's own `minRating` selection field
 // uses a 0-50 integer scale (45 = 4.5 stars, confirmed against Keepa's docs
@@ -1242,11 +1261,26 @@ async function dedupeAsinsByVariantFamily(asins) {
         `(${toCheckFull.length - fullFetchQueue.length} candidate(s) deferred to a future run).`
     );
   }
+  // Added 2026-08-24: Pass 3 previously had zero output on the success path
+  // (only on error/429), so a run that got cancelled mid-Pass-3 left no clue
+  // in the log how far it actually got — a 90-minute timeout looked
+  // identical whether it died at item 5 or item 55. Rough ETA up front, plus
+  // a line every 10 items, so the log itself shows progress and pace.
+  const etaMinutes = Math.round((fullFetchQueue.length * keepaPaceDelayMs(KEEPA_FULL_FETCH_TOKEN_COST)) / 60000);
+  console.log(
+    `  Pass 3: full-fetching ${fullFetchQueue.length} candidate(s) at ~` +
+      `${Math.round(keepaPaceDelayMs(KEEPA_FULL_FETCH_TOKEN_COST) / 1000)}s each — ~${etaMinutes}min.`
+  );
   const results = []; // [{asin, product, familyAsin, variantAttributes}, ...]
+  let pass3Checked = 0;
   for (const entry of fullFetchQueue) {
     try {
       await sleep(keepaPaceDelayMs(KEEPA_FULL_FETCH_TOKEN_COST)); // paced to the account's real token budget
       const product = await fetchKeepaProductWithRateLimitRetry(entry.asin, { full: true });
+      pass3Checked++;
+      if (pass3Checked % 10 === 0) {
+        console.log(`  Pass 3 progress: ${pass3Checked}/${fullFetchQueue.length} checked, ${results.length} kept so far.`);
+      }
       if (isParentAsin(product)) {
         // Genuinely rare now that isParentAsin() checks parentAsin rather
         // than just variations.length (see the 2026-08-22 correction on
