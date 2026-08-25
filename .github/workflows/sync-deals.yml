@@ -18,12 +18,37 @@ name: Sync Deals
 # only add them below as repo Variables if you want to override a default
 # without touching code.
 
+# Cadence — revised 2026-08-25: briefly ran daily-at-midnight (one repo
+# commit made directly on GitHub), which turned out to leave ~96% of this
+# account's real Keepa token budget unused (20 tokens/min = ~1200/hour =
+# ~28,800/day, but one run only spends ~1000-1050) — confirmed live via the
+# account's own dashboard sitting at 1194/1200 tokens available. That was
+# also why deal growth had stalled: far fewer candidate-check opportunities
+# per day than the budget actually supports.
+#
+# A real run now confirmed to take ~1h05m end to end. Plain hourly ("0 * * *
+# *") would leave negative margin — the next hour's trigger would fire
+# before the current run finishes, every time, and just perpetually queue
+# behind itself (harmless thanks to the concurrency guard below, but not
+# useful). Cron can't express "every 80 minutes" as a single expression —
+# it matches wall-clock fields (minute/hour), not raw intervals — so this
+# uses three separate cron entries that together land exactly 80 minutes
+# apart, repeating on a 4-hour cycle:
+#   :00 at hours 0,4,8,12,16,20 | :20 at hours 1,5,9,13,17,21 | :40 at
+#   hours 2,6,10,14,18,22
+# → 00:00, 01:20, 02:40, 04:00, 05:20, 06:40, ... 22:40, then 00:00 again.
+# 18 runs/day, each 80min apart — a 15min buffer over the ~65min run time,
+# and ~18,900 tokens/day requested against the ~28,800/day the account
+# earns (comfortable headroom, not maxed out).
 on:
   schedule:
-    - cron: "0 0 * * *" # every hour, on the hour (UTC) — GitHub may delay a
-    # run slightly under load; scheduled workflows also auto-disable after
-    # 60 days with zero commits to the repo (a GitHub platform limit, not
-    # something this workflow controls) — a push re-enables it.
+    - cron: "0 0,4,8,12,16,20 * * *" # UTC
+    - cron: "20 1,5,9,13,17,21 * * *" # UTC
+    - cron: "40 2,6,10,14,18,22 * * *" # UTC
+    # GitHub may delay a run slightly under load; scheduled workflows also
+    # auto-disable after 60 days with zero commits to the repo (a GitHub
+    # platform limit, not something this workflow controls) — a push
+    # re-enables it.
   workflow_dispatch: {} # adds a manual "Run workflow" button in the Actions tab
 
 # Added 2026-08-22: now that syncDeals.js paces requests to the account's
