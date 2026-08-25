@@ -417,10 +417,12 @@ async function discoverDealAsins() {
       return [];
     }
 
-    return deals
-      .map((deal) => deal.asin)
-      .filter(Boolean)
-      .slice(0, DEAL_DISCOVERY_RAW_POOL);
+    // Added 2026-08-25: no longer sliced to DEAL_DISCOVERY_RAW_POOL here —
+    // that cap, plus excluding already-active ASINs and shuffling, now
+    // happens once in main() so both discovery modes get the same anti-
+    // repetition treatment. See PRODUCT_FINDER_FETCH_POOL's doc comment for
+    // the full story.
+    return deals.map((deal) => deal.asin).filter(Boolean);
   } catch (err) {
     console.warn(
       `  ! Keepa Deals API request failed: ` +
@@ -488,6 +490,28 @@ const MIN_DEAL_REVIEW_COUNT = Number(process.env.MIN_DEAL_REVIEW_COUNT) || 100;
 // once you see what's actually coming through.
 const PRODUCT_FINDER_MAX_SALES_RANK = Number(process.env.PRODUCT_FINDER_MAX_SALES_RANK) || 30000;
 
+// Added 2026-08-25: root-caused why the site's deal count had plateaued —
+// confirmed live by comparing two consecutive runs' logs, which checked the
+// exact same ~20 ASINs in the exact same order. Cause: Keepa Product Finder
+// has no randomization and, per its own docs, "by default results are
+// sorted ascending by current sales rank" — with perPage previously tied to
+// DEAL_DISCOVERY_RAW_POOL (120), every run requested page 0 of that same
+// deterministic ordering, i.e. the identical top-120-by-sales-rank slice of
+// the match pool, every single time. Whatever didn't qualify (a stale
+// reference price, out of stock, etc.) just got re-tried forever; whatever
+// DID qualify got re-discovered and re-upserted rather than freeing up room
+// for anything new.
+// Fix has two parts, both applied in main(): (1) this constant decouples
+// the Keepa FETCH size from DEAL_DISCOVERY_RAW_POOL — confirmed via Keepa's
+// own docs that Product Finder's token cost scales with total MATCHES, not
+// perPage (10 tokens/request + 1 per 100 ASINs matched), so requesting more
+// per call is effectively free; only actually-full-fetching a candidate in
+// Pass 3 costs real tokens. (2) main() then excludes ASINs already active
+// in Supabase and shuffles what's left before slicing down to
+// DEAL_DISCOVERY_RAW_POOL, so each run samples a different slice of the
+// real match pool instead of the same deterministic prefix.
+const PRODUCT_FINDER_FETCH_POOL = Number(process.env.PRODUCT_FINDER_FETCH_POOL) || 500;
+
 async function discoverDealAsinsViaProductFinder() {
   const selection = {
     // Confirmed 2026-08-21 against Keepa's own Product Finder docs
@@ -538,7 +562,12 @@ async function discoverDealAsinsViaProductFinder() {
     hasReviews: true,
     ...(DEAL_BRAND_ALLOWLIST.length > 0 ? { brand: DEAL_BRAND_ALLOWLIST } : {}),
     page: 0,
-    perPage: Math.max(DEAL_DISCOVERY_RAW_POOL, 50),
+    // Decoupled from DEAL_DISCOVERY_RAW_POOL 2026-08-25 — see
+    // PRODUCT_FINDER_FETCH_POOL's doc comment. This just controls how much
+    // of the match pool Keepa hands back in one call (effectively free per
+    // their own token-cost docs); RAW_POOL is applied later in main(),
+    // after excluding already-active ASINs and shuffling.
+    perPage: PRODUCT_FINDER_FETCH_POOL,
     // categories_exclude above covers digital/media categories (books, movies,
     // music, etc. — see PRODUCT_FINDER_EXCLUDED_CATEGORIES). It doesn't cover
     // DVDs specifically (Movies & TV is a media category but Amazon files
@@ -565,9 +594,12 @@ async function discoverDealAsinsViaProductFinder() {
     }
 
     console.log(
-      `  Product Finder matched ${data.totalResults ?? asinList.length} total product(s) before capping.`
+      `  Product Finder matched ${data.totalResults ?? asinList.length} total product(s) ` +
+        `(fetched ${asinList.length} of them, up to PRODUCT_FINDER_FETCH_POOL=${PRODUCT_FINDER_FETCH_POOL}).`
     );
-    return asinList.slice(0, DEAL_DISCOVERY_RAW_POOL);
+    // Added 2026-08-25: no longer sliced to DEAL_DISCOVERY_RAW_POOL here —
+    // see that constant's doc comment above and PRODUCT_FINDER_FETCH_POOL's.
+    return asinList;
   } catch (err) {
     console.warn(
       `  ! Keepa Product Finder request failed: ` +
@@ -1601,18 +1633,62 @@ async function main() {
       `(>= ${MIN_DEAL_DISCOUNT_PERCENT}% off, Amazon.ca)...`
   );
 
-  let asins =
+  let rawAsins =
     DISCOVERY_MODE === "finder"
       ? await discoverDealAsinsViaProductFinder()
       : await discoverDealAsins();
 
-  if (asins.length === 0) {
+  let asins;
+  if (rawAsins.length === 0) {
     console.warn(
       `  ! Keepa discovery (mode=${DISCOVERY_MODE}) returned no candidates — falling back to ${FALLBACK_ASINS.length} manual ASIN(s).`
     );
     asins = FALLBACK_ASINS;
   } else {
-    console.log(`  Found ${asins.length} candidate deal(s) (capped at DEAL_DISCOVERY_RAW_POOL=${DEAL_DISCOVERY_RAW_POOL}).`);
+    // Added 2026-08-25: exclude ASINs already live on the site before
+    // sampling, so this run's limited Pass 3 budget goes toward candidates
+    // that could actually grow the site's deal count, not re-verifying ones
+    // already published (that's what refreshStaleActiveDeals() is for,
+    // separately). Then shuffle before slicing to DEAL_DISCOVERY_RAW_POOL —
+    // see PRODUCT_FINDER_FETCH_POOL's doc comment for why this matters:
+    // without it, every run samples the identical deterministic prefix of
+    // whatever Keepa returns.
+    const { data: activeRows, error: activeErr } = await supabase
+      .from("deals")
+      .select("asin")
+      .eq("is_active", true);
+    if (activeErr) {
+      console.warn(
+        `  ! Couldn't fetch already-active ASINs from Supabase (${activeErr.message}) — skipping ` +
+          `exclusion for this run, candidates may include already-published deals.`
+      );
+    }
+    const activeAsinSet = new Set((activeRows ?? []).map((r) => r.asin));
+    const freshAsins = rawAsins.filter((asin) => !activeAsinSet.has(asin));
+    const skippedActiveCount = rawAsins.length - freshAsins.length;
+
+    // Fisher-Yates shuffle — plain in-place shuffle, fine for a one-off
+    // per-run sample; no need for anything fancier here.
+    for (let i = freshAsins.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [freshAsins[i], freshAsins[j]] = [freshAsins[j], freshAsins[i]];
+    }
+
+    asins = freshAsins.slice(0, DEAL_DISCOVERY_RAW_POOL);
+
+    console.log(
+      `  Found ${rawAsins.length} candidate deal(s) total, ${skippedActiveCount} already active on ` +
+        `the site (skipped), ${freshAsins.length} fresh — sampling ${asins.length} of them ` +
+        `(DEAL_DISCOVERY_RAW_POOL=${DEAL_DISCOVERY_RAW_POOL}).`
+    );
+
+    if (asins.length === 0) {
+      console.log(
+        `  Every currently-matching candidate is already active on the site — nothing new to ` +
+          `check this run. Not falling back to manual ASINs; this just means Keepa's current match ` +
+          `pool is fully covered for now.`
+      );
+    }
   }
 
   console.log(`Checking ${asins.length} candidate(s) for duplicate size/color variants...`);
