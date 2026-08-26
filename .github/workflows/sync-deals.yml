@@ -134,3 +134,30 @@ jobs:
           # in Keepa's dashboard) -- raising it without more tokens/minute
           # just means a longer queue of 429s once the bucket runs dry.
           DEAL_DISCOVERY_RAW_POOL: ${{ vars.DEAL_DISCOVERY_RAW_POOL }}
+          # Added 2026-08-25, both newly wired as repo Variables here for the
+          # first time (previously code-only defaults):
+          #
+          # MAX_FULL_FETCH_CHECKS_PER_RUN — confirmed via live logs to be the
+          # ACTUAL bottleneck on how many deals get published per run, not
+          # DEAL_DISCOVERY_RAW_POOL (which already pulls in more candidates
+          # than this cap lets through — logs consistently showed "60
+          # deferred" out of 120). Code default raised 60 -> 75 (+15 items *
+          # ~39s = +9.75min) — worst observed run time (65.7min) puts a run
+          # around ~75.4min, leaving only ~4.6min of buffer under the 80min
+          # sync cadence. Real but thin margin — watch actual run times
+          # after this ships; if a run starts pushing past ~78-79min, drop
+          # this back toward 70 right here as a Variable, no code change
+          # needed. This is a wall-clock cost, unlike the knob below.
+          MAX_FULL_FETCH_CHECKS_PER_RUN: ${{ vars.MAX_FULL_FETCH_CHECKS_PER_RUN }}
+          # PRODUCT_FINDER_FETCH_POOL — how much of Keepa's match pool gets
+          # pulled per Product Finder call (code default 500). Confirmed via
+          # Keepa's own docs that Product Finder's token cost scales with
+          # total MATCHES, not this number (10 tokens/request + 1 per 100
+          # ASINs matched) — so raising it costs no extra tokens or time,
+          # it just widens how much of the real match pool is available to
+          # sample from each run (see PRODUCT_FINDER_FETCH_POOL's doc
+          # comment in syncDeals.js for the full story on why that matters).
+          # Only worth raising once PRODUCT_FINDER_MAX_SALES_RANK/
+          # MIN_DEAL_REVIEW_COUNT are loosened enough that total matches
+          # regularly exceed the current default.
+          PRODUCT_FINDER_FETCH_POOL: ${{ vars.PRODUCT_FINDER_FETCH_POOL }}

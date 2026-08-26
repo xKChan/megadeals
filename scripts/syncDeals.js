@@ -305,7 +305,7 @@ const MAX_VARIANTS_TO_CHECK_PER_FAMILY =
 // 120: the run STILL got cancelled at the full 90-minute mark, silent the
 // entire time after "Checking N candidates" (Pass 3 has no per-item log on
 // success, only on error — fixed below by adding one). Full accounting of
-// what shares the same 90-minute ceiling as Pass 3:
+// what shares the same time budget as Pass 3:
 //   Pass 1 (cheap, ~3s/candidate)         ~RAW_POOL * 3s
 //   Pass 2b (cheap, per shared parent)    usually small, but not zero
 //   Pass 3 (full, ~39s/candidate)         MAX_FULL_FETCH_CHECKS_PER_RUN * 39s
@@ -313,14 +313,27 @@ const MAX_VARIANTS_TO_CHECK_PER_FAMILY =
 //   LinkTwin + Supabase per published deal  ~1.2s each, usually minor
 // At 100, Pass 3 alone (65min) plus the rest left almost no slack — normal
 // per-request latency on top of the paced delay was enough to tip it over.
-// Dropped to 60 (60 * 39s = 39min) so the full run — Pass 1 + Pass 2b +
-// Pass 3 + the refresh pass + publishing — has real headroom under 90min
-// instead of running right up against the wall every time. Raise this again
-// only alongside either a higher job timeout-minutes or a bigger Keepa
-// token/minute plan (see PLAN & USAGE in Keepa's dashboard) — not in
-// isolation, since Pass 3's pace is fixed by the account's real token rate.
+// Dropped to 60 (60 * 39s = 39min) for real headroom under the 90min job
+// timeout that existed at the time.
+//
+// Revised again 2026-08-25: the job timeout-minutes (90) is no longer the
+// binding constraint — the sync cadence is (see sync-deals.yml: every 80
+// minutes, three cron entries). Real observed run times at 60 are 61-66
+// minutes, leaving ~14-19min of buffer before the next scheduled run would
+// start queuing behind this one. Also confirmed via live logs that Pass 3's
+// cap, not DEAL_DISCOVERY_RAW_POOL, is what's actually limiting how many
+// deals get published per run (120 raw candidates in, "60 deferred" every
+// time — RAW_POOL has more than enough supply already). Raised to 75 (+15
+// items * 39s = +9.75min, per the user's explicit request over the
+// initially-proposed 70) — worst observed run time (65.7min) plus that
+// puts a run around ~75.4min, leaving only ~4.6min of buffer under the
+// 80min cadence. That's real but thin margin, not the ~7-13min 70 would've
+// left — watch actual run times after this ships; if a run starts pushing
+// past ~78-79min, drop back toward 70 (now a repo Variable — Settings ->
+// Variables -> MAX_FULL_FETCH_CHECKS_PER_RUN — no code change needed to
+// adjust it further either direction).
 const MAX_FULL_FETCH_CHECKS_PER_RUN =
-  Number(process.env.MAX_FULL_FETCH_CHECKS_PER_RUN) || 60;
+  Number(process.env.MAX_FULL_FETCH_CHECKS_PER_RUN) || 75;
 
 // Minimum product star rating (0-5). Keepa's own `minRating` selection field
 // uses a 0-50 integer scale (45 = 4.5 stars, confirmed against Keepa's docs
